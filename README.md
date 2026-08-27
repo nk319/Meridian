@@ -5,10 +5,17 @@ streaming ingestion, a Parquet lakehouse, a dimensional warehouse, orchestration
 data quality, governance, and a retrieval-augmented AI layer over customer
 support history.
 
-> **Build status: Phase 3 of 8 complete.** This README describes the system being
-> built. Sections marked *planned* are not implemented yet. See
-> [`docs/PROGRESS.md`](docs/PROGRESS.md) for exactly what exists today — it is
-> updated at the end of every work session and is the resume point.
+> **Complete — all eight phases.** Verified from a destroyed-and-rebuilt
+> database in five minutes: `make verify-cold` runs lint, the full batch
+> pipeline, 38 data quality checks, 21 dbt models, 87 dbt tests, 271 pytest
+> tests and the retrieval evaluation, and every one of them passes.
+>
+> [`docs/CONCEPTS.md`](docs/CONCEPTS.md) maps each concept to the file that
+> demonstrates it — including a section on the ten bugs this project shipped
+> and then found, every one of which had no symptom.
+> [`docs/CONTRACTS.md`](docs/CONTRACTS.md) is the frozen interface between
+> components, with 21 recorded deviations.
+> [`docs/PROGRESS.md`](docs/PROGRESS.md) is the per-phase record.
 
 ---
 
@@ -529,7 +536,7 @@ python -m meridian.ingest.restapi --mode incremental   # captures over HTTP
 ## Repository layout
 
 ```
-docker-compose.yml  `core` profile: Postgres (pgvector) + MinIO. `full` arrives later.
+docker-compose.yml  profiles: core, stream, api, dashboard, full — bring up only what you need
 contracts/
   topics.yml        topic manifest — broker init and client constants generate from it
   schemas/          the Avro schemas it references
@@ -618,8 +625,10 @@ tests/              acceptance tests; DB-backed ones skip when the stack is down
 
 ## Concepts demonstrated
 
-A map of each concept to the file that demonstrates it lives in
-`docs/CONCEPTS.md` *(generated in Phase 8)*. Implemented so far:
+[`docs/CONCEPTS.md`](docs/CONCEPTS.md) maps each of these to the file that
+demonstrates it, with the losing alternative named wherever the decision cost
+something — plus a section on the ten bugs this project shipped and then found.
+The summary:
 
 | Concept | Where |
 | --- | --- |
@@ -695,6 +704,38 @@ non-trivial:
   dates, negative amounts and duplicate rows land in the file-drop and vendor
   sources only — never in OLTP, because orders are ingested from OLTP and
   corrupting that truth would make the reconciliation check fail permanently.
+
+---
+
+## What it verifies about itself
+
+`make verify` runs everything below against a live stack; `make verify-cold`
+destroys the volumes first, which is the only run that exercises `db/init/*.sql`
+— Postgres executes those solely on an empty data directory, so a broken init
+script survives every other target in this repository.
+
+The last cold run, in five minutes:
+
+| | |
+| --- | --- |
+| `ruff check` + `ruff format --check` | clean, 83 files |
+| Data quality | **38 checks**, 0 failed, 0 blocking |
+| dbt | **21 models**, **87 tests**, 0 errors |
+| pytest | **271 passed** |
+| Retrieval | recall@5 **1.00** hybrid / 1.00 lexical / 0.91 vector; abstention 1.00 |
+| Streaming | 3,000 produced, 2,884 consumed per group, 116 dead-lettered, lag drains to **0** on all 3 partitions |
+| API | **17/17** endpoint steps, over the network |
+| Dashboard | **8/8** tabs render, 0 exceptions |
+
+The numbers the platform produces from the default seed:
+
+| | |
+| --- | --- |
+| Revenue | £1,859,639 across 13,176 revenue-recognised orders |
+| AOV | £141.14 — recomputed, not summed (summing `nadd_aov` gives £659.73) |
+| Funnel | 49,420 → 34,800 → 24,239 → 17,685 → 14,362 sessions |
+| `dim_customer` | 3,003 versions for 3,000 customers — SCD2 with real history |
+| Batch/stream reconciliation | 157,291 Bronze rows in, 153,136 Silver rows out |
 
 ---
 

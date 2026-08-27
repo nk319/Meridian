@@ -245,6 +245,9 @@ lint:  ## Lint and format check
 	$(PY) -m ruff format --check src tests dashboard
 
 verify:  ## Everything the README claims, from a cold start
+# Deliberately does NOT `make reset`. Destroying volumes is not something a
+# verification target should do to somebody's machine without being asked —
+# `make verify-cold` is the one that does, and it says so in its name.
 	$(MAKE) lint
 	$(MAKE) seed
 	$(MAKE) up
@@ -253,6 +256,16 @@ verify:  ## Everything the README claims, from a cold start
 	$(MAKE) gold
 	$(MAKE) test
 	$(MAKE) rag-eval
+
+verify-cold:  ## DESTROYS VOLUMES, then verifies from a genuinely empty database
+# The only run that exercises db/init/*.sql, which Postgres executes solely on
+# an empty data directory. Everything else tests a database that was already
+# correct, so a broken init script survives every other target in this file.
+	$(MAKE) reset
+	$(MAKE) verify
+	$(MAKE) stream-up
+	$(MAKE) stream-demo
+	$(RUN) -m meridian.api.demo || echo "  (start the API with \`make api\` to include it)"
 
 clean:  ## Remove generated data
 	rm -rf seeds/ .pytest_cache/ .ruff_cache/ dbt/target/ dbt/logs/

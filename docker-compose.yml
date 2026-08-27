@@ -1,11 +1,20 @@
 # Meridian local stack.
 #
-# Profiles keep the footprint honest. `core` is everything Phase 1 needs and
-# nothing else — Postgres and MinIO, about 700 MB resident. Later phases add
-# `full` (Redpanda, Airflow, the API, the dashboard), which peaks around 6.5 GB.
-# Running one profile must never require standing up the other.
+# Profiles keep the footprint honest, and bringing one up must never require
+# standing up another.
+#
+#   core       Postgres (pgvector) + MinIO. ~700 MB. Everything the batch
+#              pipeline, the lake, the warehouse and the AI layer need.
+#   stream     Redpanda + its console.
+#   api        The FastAPI service.
+#   dashboard  Streamlit.
+#   full       All of the above plus the four Airflow containers. ~6.5 GB.
 #
 #   docker compose --profile core up -d
+#
+# `core` is what `make up` starts, and it is enough for `make pipeline`,
+# `make gold`, `make rag-index` and the whole test suite bar the streaming
+# tests, which skip cleanly without a broker.
 #
 # Every value comes from .env (copy .env.example). Nothing here carries a
 # default credential: an unset password fails the init scripts loudly rather

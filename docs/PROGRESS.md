@@ -10,11 +10,11 @@ history, which does not survive a container restart.
 
 | | |
 | --- | --- |
-| **Phase** | 7 — Streamlit dashboard |
-| **Status** | ✅ Complete |
-| **Tag** | `phase-3` … `phase-7` — all need a human to push them, see below |
-| **Next phase** | 8 — `docs/CONCEPTS.md` and the final pass |
-| **Next action** | Write `docs/CONCEPTS.md` mapping every concept to the file that demonstrates it, do a final README pass, and run `make verify` from a genuinely cold start (`make reset` first) to confirm every claim in this repository. |
+| **Phase** | 8 — `docs/CONCEPTS.md` and the final pass |
+| **Status** | ✅ **Complete. All eight phases are done.** |
+| **Tag** | `phase-3` … `phase-8` — all need a human to push them, see below |
+| **Next phase** | None. The build is finished. |
+| **Next action** | Nothing is outstanding in the code. The two things a human can do that this session cannot: **push the tags** (below), and set `ANTHROPIC_API_KEY` + run `make rag-enrich` to populate `gold.mart_support_health`'s AI columns — the join, the agreement flags and the null-safe denominators are all exercised; only the model call is missing. |
 
 ### What this session can and cannot push
 
@@ -61,6 +61,7 @@ Practical consequences for a future session:
   git tag -a phase-5 1c0fce3 -m "Phase 5: Redpanda streaming"
   git tag -a phase-6 92c3429 -m "Phase 6: FastAPI service"
   git tag -a phase-7 7148694 -m "Phase 7: Streamlit dashboard"
+  git tag -a phase-8 <sha of "Phase 8: CONCEPTS.md"> -m "Phase 8: docs and final verification"
   git push origin --tags
   ```
 
@@ -560,6 +561,93 @@ margin £812,318 — and the funnel is monotonic at 49,420 → 34,800 → 24,239
 A factor of 4.7, and the wrong one draws as a perfectly plausible chart line.
 That is what the `nadd_` prefix is for, and `dashboard/metrics.py` is where
 honouring it actually happens.
+
+---
+
+## Phase 8 — complete
+
+**Goal:** map every concept to the code that demonstrates it, and verify the
+whole platform from a destroyed database.
+
+### Delivered
+
+| Artifact | What it does |
+| --- | --- |
+| [`docs/CONCEPTS.md`](CONCEPTS.md) | 14 sections, ~100 concepts, each pointing at a file — and a final section on the ten bugs this project shipped and then found |
+| `make verify-cold` | `make reset` first, so `db/init/*.sql` is actually exercised |
+| README final pass | Verified numbers replacing every "planned" marker |
+
+### Acceptance — met, from an empty database
+
+`docker compose down -v` on every profile, then `make verify`, in **5m 02s**:
+
+```
+ruff check + ruff format       clean, 83 files
+data quality                   38 checks, 0 failed, 0 blocking
+dbt                            21 models, 87 tests, 0 errors
+pytest                         271 passed
+retrieval                      recall@5 1.00 hybrid / 1.00 lexical / 0.91 vector
+                               abstention 1.00, threshold gap 0.626 → 0.730
+```
+
+Then the halves `make verify` does not start services for:
+
+```
+stream-demo    3,000 produced · 2,884 consumed per group · 116 dead-lettered
+               lag drains to 0 on all 3 partitions, both groups
+api-demo       17/17 endpoint steps, over the network
+dashboard      8/8 tabs render, 0 exceptions
+```
+
+### Why `verify-cold` is a separate target
+
+`make verify` runs against whatever database is there. That is the right default
+— destroying somebody's volumes is not something a verification target should do
+without being asked — but it means the one thing it never tests is `db/init/`,
+which Postgres executes **only on an empty data directory**. A broken init
+script survives every other target in the Makefile. `verify-cold` says what it
+does in its name and is the run that would catch it.
+
+### What CONCEPTS.md is for
+
+Two rules govern it. Every row points at code that runs, not at a comment
+claiming a technique is used. And where a decision had a losing alternative, the
+alternative is named — "we use a star schema" is not an insight; "we split the
+order fact into header and line grains because header-only makes `dim_product`
+unjoinable and line-only forces `count(distinct order_id)` into every revenue
+query" is.
+
+Its last section is the one worth reading: **ten bugs this project shipped and
+then found**, with why each was invisible. A `\b` that never matched a phone
+number. Redaction tokens poisoning BM25 in 30% of the corpus. Hybrid retrieval
+that was silently vector-only. A `.sql` file missing from the wheel. A customer
+deleted four months before signing up. A Kafka batch committing one partition of
+three. Seven of eight dashboard tabs broken with every test green.
+
+The pattern is identical in every case: **the failure had no symptom.** Nothing
+errored, nothing went red, and the output looked reasonable. That is the whole
+argument for the contracts, the measured baselines, the tests that assert they
+are not vacuous, and the reproduction query on every quality finding.
+
+---
+
+## The platform, finished
+
+| Phase | What it added | Tag |
+| --- | --- | --- |
+| 0 | Contracts, seed generator, governance | `phase-0` |
+| 1 | Masking, embeddings, hybrid retrieval, the golden eval | `phase-1` |
+| 2 | Bronze/Silver, four ingestors, the warehouse loader | `phase-2` |
+| 3 | Data quality suites, Airflow, three isolated interpreters | `phase-3` |
+| 4 | The dbt star schema, SCD2 with real history, seven marts | `phase-4` |
+| 5 | Redpanda, two consumer groups, a DLQ, lag as a time series | `phase-5` |
+| 6 | The FastAPI service and the role boundary per handler | `phase-6` |
+| 7 | The Streamlit dashboard, cached on the pipeline watermark | `phase-7` |
+| 8 | `CONCEPTS.md` and cold verification | `phase-8` |
+
+**12,589 lines** of Python across `src/` and `dashboard/`, 21 dbt models,
+6 singular dbt tests, 38 data quality checks, 271 pytest tests, 3 Airflow DAGs,
+5 source systems, 7 warehouse schemas and 6 database roles.
 
 ---
 
