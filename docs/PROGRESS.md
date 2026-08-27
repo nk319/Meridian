@@ -12,14 +12,29 @@ history, which does not survive a container restart.
 | --- | --- |
 | **Phase** | 1 — AI/RAG core |
 | **Status** | ✅ Complete |
-| **Tag** | `phase-1`, on branch `claude/phase-1-setup-8lokjp` until it merges |
+| **Tag** | `phase-1` — **created locally, not on the remote**, see below |
 | **Next phase** | 2 — Batch ingestion and the lakehouse |
 | **Next action** | Land Bronze Parquet on MinIO from the five seed sources, then prove the DuckDB → Arrow → `COPY` hop into `silver` before writing any warehouse code (CONTRACTS.md §3) |
 
-**Not blocked.** The Phase 0 note about being unable to push is resolved: the
-repository is attached and `main` now points at the Phase 0 commit, which it did
-not before — `main` held an unrelated "Initial commit" while all Phase 0 work sat
-on the `phase-0` tag, unreachable from any branch.
+**Not blocked, one loose end.** The Phase 0 note about being unable to push is
+resolved: the repository is attached, branch pushes work, and `main` now points
+at the Phase 0 commit, which it did not before — `main` held an unrelated
+"Initial commit" while all Phase 0 work sat on the `phase-0` tag, unreachable
+from any branch.
+
+**Pushing a tag is 403 from this environment.** `git push origin refs/tags/phase-1`
+fails with HTTP 403 on every attempt while `git push origin <branch>` to the same
+remote succeeds, and the GitHub tool surface available here exposes no
+tag-creation call. So `phase-1` exists in the local repository and on no remote.
+Someone with tag-push permission needs to run:
+
+```bash
+git push origin refs/tags/phase-1
+```
+
+Until that happens the resume point for Phase 1 is the branch
+`claude/phase-1-setup-8lokjp`, not the tag. Worth resolving before Phase 2, since
+this file names the `phase-N` tags as half of what makes a session resumable.
 
 ---
 
