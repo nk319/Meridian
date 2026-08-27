@@ -1,0 +1,39 @@
+# Kafka/Redpanda topic manifest — the single source of truth.
+#
+# The broker init script and the producer/consumer topic constants are generated
+# from this file (Phase 5), so the four-way drift that an earlier design had
+# between init script, producer, consumer and dashboard cannot recur.
+
+version: 1
+
+defaults:
+  replication_factor: 1      # single-node Redpanda on a laptop
+  retention_ms: 604800000    # 7 days
+
+topics:
+  - name: ecom.web.events.v1
+    partitions: 3
+    key_field: session_id
+    # Keying by session keeps a visitor's events in one partition and therefore
+    # in order, which is what makes funnel-step ordering meaningful.
+    value_schema: schemas/web_event.avsc
+    consumer_groups: [bronze-sink, realtime-metrics]
+
+  - name: ecom.orders.placed.v1
+    partitions: 3
+    key_field: customer_id
+    # Per-customer ordering matters for SCD2 sanity: two events for the same
+    # customer must not be processed out of order.
+    value_schema: schemas/order_placed.avsc
+    consumer_groups: [bronze-sink]
+
+  - name: ecom.dlq.v1
+    partitions: 1
+    key_field: null
+    # Dead letters. Ordering is irrelevant and volume is low.
+    value_schema: schemas/dlq_envelope.avsc
+    consumer_groups: []
+
+# Three partitions rather than six: with three consumers each takes exactly one,
+# which makes the rebalance demonstration legible. Six partitions with one
+# consumer demonstrates nothing extra and just adds files to inspect.

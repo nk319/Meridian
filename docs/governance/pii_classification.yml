@@ -1,0 +1,102 @@
+# PII classification.
+#
+# This file is the source of truth. The Postgres grants, the dbt
+# assert_no_pii_columns_in_marts test, and the RAG masking layer all read from
+# it — classification stated only in prose is documentation, not a control.
+#
+# Levels
+#   restricted  directly identifies a person. Lives in `secure`. Never in gold.
+#   sensitive   does not identify alone, but does in combination. Masked in RAG.
+#   internal    business data, safe for analytics.
+#   public      safe to expose anywhere.
+
+version: 1
+owner_team: data-platform
+
+levels:
+  restricted:
+    description: Directly identifies a natural person.
+    storage_schema: secure
+    allowed_roles: [meridian_app, meridian_etl]
+    forbidden_in: [gold, gold_stg, gold_int, rag]
+  sensitive:
+    description: Identifies in combination with other fields.
+    allowed_roles: [meridian_app, meridian_etl, dbt_runner]
+    forbidden_in: [rag]
+  internal:
+    description: Business data. Safe for analytics consumers.
+    allowed_roles: [meridian_app, meridian_etl, dbt_runner, analytics_ro, rag_indexer]
+  public:
+    description: Safe to expose anywhere.
+
+columns:
+  - table: secure.customer_pii
+    column: first_name
+    level: restricted
+    basis: name
+  - table: secure.customer_pii
+    column: last_name
+    level: restricted
+    basis: name
+  - table: secure.customer_pii
+    column: email
+    level: restricted
+    basis: contact
+  - table: secure.customer_pii
+    column: phone
+    level: restricted
+    basis: contact
+
+  - table: silver.customers
+    column: city
+    level: sensitive
+    basis: location
+  - table: silver.customers
+    column: country
+    level: internal
+  - table: silver.customers
+    column: loyalty_tier
+    level: internal
+  - table: silver.customers
+    column: signup_date
+    level: internal
+
+  # Ticket free text is the hard case: it is unstructured, it demonstrably
+  # contains names and emails, and it is the RAG corpus. It is masked before
+  # embedding, by dictionary lookup against seeds/known_pii_terms.json.
+  - table: silver.support_tickets
+    column: subject
+    level: sensitive
+    basis: free_text_may_contain_identifiers
+    masking: dictionary_and_regex
+  - table: silver.support_tickets
+    column: body
+    level: sensitive
+    basis: free_text_may_contain_identifiers
+    masking: dictionary_and_regex
+
+masking:
+  # Dictionary first, regex second. Regex alone misses unusual names, and the
+  # indexer's content-hash skip logic means anything that leaks on the first
+  # pass is never re-embedded — the leak becomes permanent and silent.
+  strategy: dictionary_then_regex
+  dictionary_source: seeds/known_pii_terms.json
+  replacements:
+    name: "[CUSTOMER_NAME]"
+    email: "[EMAIL]"
+    phone: "[PHONE]"
+  regex_fallback:
+    email: '[\w\.\-\+]+@[\w\-]+\.\w{2,}'
+    phone: '\+?\d{1,3}[-\s]?\(?\d{2,4}\)?[-\s]?\d{3,4}[-\s]?\d{3,4}'
+
+enforcement:
+  - mechanism: physical_separation
+    detail: Restricted columns live in the `secure` schema, never in `silver.customers`.
+  - mechanism: role_grants
+    detail: analytics_ro and rag_indexer hold no grant on `secure`.
+  - mechanism: test
+    detail: tests/test_pii_boundary.py asserts InsufficientPrivilege for analytics_ro.
+  - mechanism: dbt_test
+    detail: assert_no_pii_columns_in_marts fails the build if a restricted column reaches gold.
+  - mechanism: test
+    detail: tests/test_pii_manifest.py asserts zero manifest terms in the vector store.

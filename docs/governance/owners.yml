@@ -1,0 +1,66 @@
+# Data ownership and stewardship.
+#
+# Every Gold asset has exactly one owning team and a named steward. An asset with
+# no owner is an asset nobody fixes when its quality check fails.
+
+version: 1
+
+teams:
+  data-platform:
+    steward: Noah Khan
+    responsibilities: [ingestion, lake, warehouse, orchestration, data quality]
+  analytics:
+    steward: Noah Khan
+    responsibilities: [marts, dashboard, metric definitions]
+  ai-platform:
+    steward: Noah Khan
+    responsibilities: [rag, embeddings, enrichment, eval]
+
+assets:
+  - name: gold.dim_customer
+    owner: data-platform
+    sla_hours: 24
+    notes: SCD2. Version history must not be rebuilt without a backfill plan.
+  - name: gold.dim_product
+    owner: data-platform
+    sla_hours: 24
+  - name: gold.dim_date
+    owner: data-platform
+    sla_hours: 720
+  - name: gold.fact_orders
+    owner: data-platform
+    sla_hours: 6
+  - name: gold.fact_order_items
+    owner: data-platform
+    sla_hours: 6
+  - name: gold.fact_payments
+    owner: data-platform
+    sla_hours: 6
+  - name: gold.fact_web_events
+    owner: data-platform
+    sla_hours: 12
+  - name: gold.fact_support_tickets
+    owner: ai-platform
+    sla_hours: 12
+    notes: Carries LLM enrichment columns. Degrades to nulls without an API key.
+  - name: gold.mart_daily_sales
+    owner: analytics
+    sla_hours: 6
+  - name: gold.mart_customer_rfm
+    owner: analytics
+    sla_hours: 24
+  - name: gold.mart_cohort_retention
+    owner: analytics
+    sla_hours: 24
+  - name: gold.mart_product_performance
+    owner: analytics
+    sla_hours: 12
+  - name: gold.mart_payment_health
+    owner: analytics
+    sla_hours: 6
+  - name: gold.mart_web_funnel
+    owner: analytics
+    sla_hours: 12
+  - name: gold.mart_support_health
+    owner: ai-platform
+    sla_hours: 12

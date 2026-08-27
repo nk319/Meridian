@@ -1,0 +1,38 @@
+# Generated source data. The generator is deterministic — regenerate with
+# `make seed` rather than committing 23MB of CSV.
+seeds/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Secrets — never committed. .env.example is the template.
+.env
+.env.local
+*.pem
+
+# Local service state
+.duckdb/
+minio-data/
+postgres-data/
+logs/
+
+# dbt
+target/
+dbt_packages/
+logs/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
