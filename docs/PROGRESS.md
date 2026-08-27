@@ -10,11 +10,11 @@ history, which does not survive a container restart.
 
 | | |
 | --- | --- |
-| **Phase** | 6 — FastAPI service |
+| **Phase** | 7 — Streamlit dashboard |
 | **Status** | ✅ Complete |
-| **Tag** | `phase-3` … `phase-6` — all need a human to push them, see below |
-| **Next phase** | 7 — Streamlit dashboard |
-| **Next action** | Build the dashboard: reads **only** `gold`, and only through `dashboard/metrics.py`; cache key is `meta.pipeline_run_log.completed_at`; a stale-watermark warning banner; Playwright screenshots (CONTRACTS.md §7 and §8). Every `nadd_` column must be recomputed after aggregation rather than summed — `tests/test_gold.py` enforces the prefix, and the dashboard is what has to honour it. |
+| **Tag** | `phase-3` … `phase-7` — all need a human to push them, see below |
+| **Next phase** | 8 — `docs/CONCEPTS.md` and the final pass |
+| **Next action** | Write `docs/CONCEPTS.md` mapping every concept to the file that demonstrates it, do a final README pass, and run `make verify` from a genuinely cold start (`make reset` first) to confirm every claim in this repository. |
 
 ### What this session can and cannot push
 
@@ -49,10 +49,10 @@ Practical consequences for a future session:
 
   ```bash
   git fetch origin
-  git push origin refs/tags/phase-3 refs/tags/phase-4 refs/tags/phase-5 refs/tags/phase-6
+  git push origin --tags
   ```
 
-  All four tags already exist locally in this session's clone but cannot leave it.
+  All the tags already exist locally in this session's clone but cannot leave it.
   To recreate them from scratch in your own clone:
 
   ```bash
@@ -60,7 +60,8 @@ Practical consequences for a future session:
   git tag -a phase-4 4d849e6 -m "Phase 4: dbt Gold star schema"
   git tag -a phase-5 1c0fce3 -m "Phase 5: Redpanda streaming"
   git tag -a phase-6 92c3429 -m "Phase 6: FastAPI service"
-  git push origin refs/tags/phase-3 refs/tags/phase-4 refs/tags/phase-5 refs/tags/phase-6
+  git tag -a phase-7 7148694 -m "Phase 7: Streamlit dashboard"
+  git push origin --tags
   ```
 
 The branch `claude/phase-1-setup-8lokjp` carries every phase. (The name is Phase
@@ -498,6 +499,67 @@ since the watermark.
   Both paths end in the same `read_json`, so the transport is the only difference.
 - Ruff now knows FastAPI's `Query`/`Depends`/`Header` are not mutable defaults
   (`extend-immutable-calls`), narrowly rather than by disabling B008.
+
+---
+
+## Phase 7 — complete
+
+**Goal:** a dashboard that reads only `gold`, caches on the pipeline watermark,
+and says so when the data is stale.
+
+### Delivered
+
+| Artifact | What it does |
+| --- | --- |
+| `dashboard/metrics.py` | Every query the dashboard makes. The only file with SQL in it |
+| `dashboard/app.py` | Eight tabs; no SQL, enforced by test |
+| `dashboard/screenshots.py` | Clicks every tab, fails on a rendered exception, writes `docs/images/` |
+| `.streamlit/config.toml` | Local-development server settings, each with its reason |
+| `tests/test_dashboard.py` | 13 tests: the read boundary, additivity, freshness |
+
+### Acceptance — met
+
+```
+271 pytest                     # everything up, no ANTHROPIC_API_KEY
+ruff check + ruff format       # clean, now including dashboard/
+8/8 tabs render, 0 exceptions  # make dashboard-shots
+```
+
+Revenue £1,859,639 over 13,176 revenue-recognised orders, AOV £141.14,
+margin £812,318 — and the funnel is monotonic at 49,420 → 34,800 → 24,239 →
+17,685 → 14,362 sessions.
+
+### Decisions taken
+
+| Decision | Reasoning |
+| --- | --- |
+| One read path, enforced by a source test | A dashboard that reaches past the marts is a second transform layer — in Python, untested, free to disagree with dbt about what revenue means. When it does, nobody can tell which number is wrong. |
+| The cache key is the watermark, not a TTL | A completed run invalidates all eight tabs at once; a failed one invalidates none, because `completed_at` stays null while a run is in flight. A TTL serves pre-load numbers for its duration and cannot say it is doing so. |
+| Missing and stale are different banners | "The pipeline has never completed" and "the data is six hours old" need different responses. Collapsing them renders the first as the second. |
+| `recompute_aov` / `recompute_rate` live in `metrics.py` | "Remember to divide rather than sum" is not a rule that survives the next panel. Recomputing once, centrally, is what makes the `nadd_` prefix mean something. |
+| Date bounds come from the data | The generator writes to a fixed anchor, so a "last 30 days" default opens on an empty chart the moment the demo is a month old. |
+| A fresh connection per query | Streamlit reruns the script on every interaction, on a thread that changes. A connection cached across reruns is a race that surfaces as `InFailedSqlTransaction` on an unrelated panel; the marts are pre-aggregated, so the connection is not the cost. |
+| The screenshot run is a **test** | Streamlit renders an uncaught exception into the page rather than failing the process, so a broken panel serves HTTP 200 all day and no unit test can see it. Clicking every tab and failing on `stException` is the only automated way to find out. |
+| The dashboard container gets `ANALYTICS_RO_PASSWORD` and no other | §1's boundary, enforced by omission as well as by grant: it cannot use a role whose password it does not have. |
+
+### Bugs found and fixed
+
+| Bug | How it surfaced |
+| --- | --- |
+| **Seven of eight tabs were broken and every test was green.** psycopg maps Postgres `numeric` to `decimal.Decimal`, which lands in pandas as dtype `object`. | `.sum()` works on it — so the unit tests passed — while `.nlargest()` raises `cannot use method 'nlargest' with this dtype` and Plotly renders an empty axis. Caught on the *first* run of `dashboard/screenshots.py`, which is precisely the case it was written for. Fixed once at the boundary in `_query` rather than with a cast in each caller. |
+| **`astype(float)` on a pandas NA.** `replace(0, pd.NA)` before a division. | `TypeError: float() argument must be ... not 'NAType'`. Dividing by NaN yields NaN; dividing by pandas' NA yields an NAType that `astype` then refuses. `Series.where(x != 0)` is the version that works. |
+| **Playwright could not find Chromium.** It resolves the browser by a build number baked into the Python package (1234); the image ships 1194. | The error says "run `playwright install`", which in this environment is both wrong and a large download. The path is now found by searching `PLAYWRIGHT_BROWSERS_PATH`. |
+
+### The additivity rule, measured
+
+| | value |
+| --- | ---: |
+| `sum(nadd_aov)` across the six channels of a day, averaged | **£659.73** |
+| `sum(revenue) / sum(revenue_orders)`, averaged | **£141.14** |
+
+A factor of 4.7, and the wrong one draws as a perfectly plausible chart line.
+That is what the `nadd_` prefix is for, and `dashboard/metrics.py` is where
+honouring it actually happens.
 
 ---
 

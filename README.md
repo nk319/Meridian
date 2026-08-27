@@ -106,6 +106,7 @@ make stream-up            # Redpanda + the topics declared in contracts/topics.y
 make stream-demo          # produce, consume with both groups, show lag and the DLQ
 make api                  # the REST API on :8000 — /docs is the OpenAPI browser
 make api-demo             # exercise every endpoint over the network
+make dashboard            # the Streamlit dashboard on :8501
 make rag-eval             # measure recall@5 against the golden set
 make test                 # the full suite
 ```
@@ -424,6 +425,52 @@ that happens to work, not a calibrated one.
 
 ---
 
+## The dashboard
+
+![Revenue](docs/images/dashboard-00-revenue.png)
+
+Eight tabs — revenue, customers, retention, products, payments, funnel, support
+and AI, operations. Every panel reads `gold` (and `meta`, for the freshness
+watermark and the quality results) through `dashboard/metrics.py`, and **`app.py`
+contains no SQL at all.** `tests/test_dashboard.py` fails if it does.
+
+That rule is the whole reason the star schema is worth building. A dashboard
+that reaches past the marts for "just one number" has become a second transform
+layer — in Python, untested, and free to disagree with dbt about what revenue
+means. When it does, nobody can tell which number is wrong.
+
+**Panels are cached on the pipeline watermark, not on a clock.** Every loader
+takes `meta.pipeline_run_log.completed_at` as an argument, so `st.cache_data`
+keys on it: a completed run invalidates all eight tabs at once, and a *failed*
+one invalidates none — `completed_at` stays null while a run is in flight, so
+partial data cannot present itself as fresh. A TTL would serve pre-load numbers
+for its duration and be unable to say it was doing so.
+
+When the watermark is missing the banner says so in red; when it is more than
+six hours old, in amber, with the age. Never a silent fallback constant, which
+is what hides a broken pipeline behind numbers that look fine.
+
+**The `nadd_` prefix is honoured here or nowhere.** `mart_daily_sales` is at
+(day, channel) grain, so summing across channels is right for `revenue` and
+catastrophic for `nadd_aov`:
+
+| | value |
+| --- | ---: |
+| `sum(nadd_aov)` across the six channels of a day, averaged | £659.73 |
+| `sum(revenue) / sum(revenue_orders)`, averaged | **£141.14** |
+
+A factor of 4.7, and the wrong one draws as a perfectly plausible line.
+`metrics.recompute_aov` exists so no panel has to remember.
+
+**`make dashboard-shots` is a test, not just documentation.** Streamlit renders
+an uncaught exception *into the page* rather than failing the process, so a
+broken panel serves HTTP 200 all day and no unit test can see it. The
+screenshot run clicks every tab and fails if Streamlit's exception block appears
+anywhere. It earned its place on the first run, catching a `decimal.Decimal`
+dtype bug that had broken seven of eight tabs while every test stayed green.
+
+---
+
 ## The API
 
 The platform's own source system, served over HTTP, and the AI layer over its
@@ -560,6 +607,10 @@ scripts/
 airflow/
   Dockerfile        three isolated interpreters in one image
   dags/             meridian_batch (14 tasks) and meridian_rag (asset-scheduled)
+dashboard/
+  metrics.py        every query the dashboard makes — the only file with SQL
+  app.py            eight tabs; no SQL, enforced by test
+  screenshots.py    clicks every tab, fails on a rendered exception
 tests/              acceptance tests; DB-backed ones skip when the stack is down
 ```
 
@@ -616,6 +667,11 @@ A map of each concept to the file that demonstrates it lives in
 | Keyset (cursor) pagination | `api/routers/tickets.py` |
 | Liveness vs. readiness | `api/main.py` — `/health` makes no database call |
 | One transport swapped under a fixed contract | `ingest/restapi.py` — file or HTTP |
+| A dashboard with exactly one read path | `dashboard/metrics.py`, enforced by `tests/test_dashboard.py` |
+| Cache invalidation on a data watermark | `dashboard/app.py` — `st.cache_data` keyed on `completed_at` |
+| Stale-data warning instead of a silent fallback | `dashboard/app.py` — `freshness_banner` |
+| Non-additive measures recomputed post-aggregation | `metrics.recompute_aov` — £141 vs. £660 |
+| Rendering smoke-tested in a real browser | `dashboard/screenshots.py` |
 | LLM enrichment scored against ground truth | `rag/enrich.py`, `mart_support_health.sql` |
 
 ---
