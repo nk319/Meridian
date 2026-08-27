@@ -77,9 +77,13 @@ COPY src /opt/meridian/src
 # airflow user can write, which a read-only bind mount of the repo would not be.
 COPY dbt /opt/meridian/dbt
 
+# The dashboard. Baked so the image is runnable standalone; docker-compose
+# bind-mounts over it so a demonstrator can edit a panel and reload.
+COPY dashboard /opt/meridian/dashboard
+
 RUN python3 -m venv /opt/meridian-venv \
     && /opt/meridian-venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/meridian-venv/bin/pip install --no-cache-dir "/opt/meridian[rag,stream]" pandera pandas
+    && /opt/meridian-venv/bin/pip install --no-cache-dir "/opt/meridian[rag,stream,dashboard]" pandera pandas
 
 RUN python3 -m venv /opt/dbt-venv \
     && /opt/dbt-venv/bin/pip install --no-cache-dir --upgrade pip \
@@ -88,7 +92,7 @@ RUN python3 -m venv /opt/dbt-venv \
 # Prove the separation held, at build time rather than at first DAG run. If a
 # resolver decision quietly broke one of the three, the image fails to build
 # instead of producing a scheduler that starts and then cannot run anything.
-RUN /opt/meridian-venv/bin/python -c "import meridian, duckdb, psycopg, pandera, confluent_kafka, fastavro; print('meridian venv ok')" \
+RUN /opt/meridian-venv/bin/python -c "import meridian, duckdb, psycopg, pandera, confluent_kafka, fastavro, streamlit; print('meridian venv ok')" \
     && /opt/dbt-venv/bin/dbt --version > /dev/null && echo "dbt venv ok" \
     && python -c "import airflow; print('airflow', airflow.__version__)"
 

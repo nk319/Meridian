@@ -50,6 +50,17 @@ api = [
     # fastapi.testclient needs to exist at all.
     "httpx>=0.27",
 ]
+# Phase 7. Playwright is here rather than in `dev` because
+# `dashboard/screenshots.py` is not only a test — it produces the images in
+# docs/, so it belongs with the thing it photographs.
+dashboard = [
+    "streamlit>=1.40",
+    "plotly>=5.24",
+    "pandas>=2.2",
+    # Screenshots and the render smoke test. Chromium is expected to be
+    # already present — see dashboard/screenshots.py.
+    "playwright>=1.47",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",

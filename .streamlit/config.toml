@@ -1,0 +1,16 @@
+# Local development only. Both settings would be wrong anywhere else and are
+# here for the same reason: this stack is bound to localhost and the dashboard
+# is a demonstration, not a deployment.
+[server]
+headless = true
+# Streamlit's XSRF protection breaks the Playwright screenshot run and buys
+# nothing against a server nobody else can reach.
+enableXsrfProtection = false
+enableCORS = false
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#2563eb"

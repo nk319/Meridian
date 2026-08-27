@@ -4,7 +4,8 @@
         rag-index rag-reindex rag-eval rag-enrich ask search verify \
         dbt-venv dbt-run dbt-test dbt-snapshot dbt-snapshot-backfill dbt-results dbt-docs gold \
         stream-up stream-down stream-topics stream-produce stream-consume stream-lag \
-        stream-dlq stream-demo api api-up api-down api-token api-demo
+        stream-dlq stream-demo api api-up api-down api-token api-demo \
+        dashboard dashboard-up dashboard-down dashboard-shots
 
 # Prefer the project venv when one exists. The RAG layer needs psycopg,
 # fastembed and pgvector; the seed generator is stdlib-only and runs anywhere.
@@ -103,6 +104,22 @@ airflow-logs:  ## Tail the scheduler
 airflow-test:  ## Parse the DAGs and report import errors
 	docker compose --profile full run --rm airflow-init bash -c \
 	  "airflow dags list && airflow dags list-import-errors"
+
+# --------------------------------------------------------------------------
+# The dashboard. CONTRACTS.md §7 and §8.
+# --------------------------------------------------------------------------
+dashboard:  ## Run the dashboard on the host. http://localhost:8501
+	PYTHONPATH=src:. $(PY) -m streamlit run dashboard/app.py --server.port $(or $(DASHBOARD_PORT),8501)
+
+dashboard-up:  ## Run the dashboard in a container
+	docker compose --profile dashboard up -d --wait dashboard
+	@echo "dashboard on http://localhost:$(or $(DASHBOARD_PORT),8501)"
+
+dashboard-down:  ## Stop the containerised dashboard
+	docker compose --profile dashboard down
+
+dashboard-shots:  ## Screenshot every tab, and fail if any rendered an exception
+	PYTHONPATH=src:. $(PY) -m dashboard.screenshots
 
 # --------------------------------------------------------------------------
 # The API. CONTRACTS.md §1 and §5.
@@ -224,8 +241,8 @@ test:  ## Run the test suite. DB-backed tests skip when the stack is down.
 	$(PY) -m pytest
 
 lint:  ## Lint and format check
-	$(PY) -m ruff check src tests
-	$(PY) -m ruff format --check src tests
+	$(PY) -m ruff check src tests dashboard
+	$(PY) -m ruff format --check src tests dashboard
 
 verify:  ## Everything the README claims, from a cold start
 	$(MAKE) lint

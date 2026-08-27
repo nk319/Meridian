@@ -123,6 +123,52 @@ services:
     restart: "no"
 
   # --------------------------------------------------------------------------
+  # The dashboard. CONTRACTS.md §7 and §8.
+  #
+  # Reuses the Airflow image for the same reason the API does — it already
+  # carries the pipeline, and a second multi-gigabyte image differing only in
+  # its entrypoint buys nothing. The dashboard's own dependencies (streamlit,
+  # plotly) are installed into that image's pipeline venv.
+  #
+  # `dashboard/` is bind-mounted rather than baked. It is the one component
+  # somebody demonstrating this will want to edit and reload without a rebuild,
+  # and it holds no secrets — the connection is opened by `meridian.db` from the
+  # environment below.
+  # --------------------------------------------------------------------------
+  dashboard:
+    image: meridian-airflow:3.1.3
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    profiles: [dashboard, full]
+    container_name: meridian-dashboard
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MERIDIAN_ROOT: /opt/meridian
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      # `analytics_ro` and nothing else. The dashboard cannot be handed a role
+      # it should not use if the password for one is never in its environment —
+      # CONTRACTS.md §1's boundary, enforced by omission as well as by grant.
+      ANALYTICS_RO_PASSWORD: ${ANALYTICS_RO_PASSWORD}
+    command: >-
+      /opt/meridian-venv/bin/python -m streamlit run /opt/meridian/dashboard/app.py
+      --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    volumes:
+      - ./dashboard:/opt/meridian/dashboard:ro
+    ports:
+      - "${DASHBOARD_PORT:-8501}:8501"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
   # The platform's own API. CONTRACTS.md §1 and §5.
   #
   # Reuses the Airflow image rather than building a second one. That image

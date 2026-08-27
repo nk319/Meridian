@@ -17,7 +17,11 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+# `src` for the package, and the root itself for `dashboard`, which is a
+# top-level directory rather than part of the installed distribution — it is an
+# application that consumes `meridian`, not a module of it.
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 
 from meridian.rag.masking import Masker  # noqa: E402
 from meridian.settings import settings  # noqa: E402
