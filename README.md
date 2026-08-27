@@ -100,6 +100,8 @@ make seed                 # generate all source data (deterministic, ~15s)
 make up                   # Postgres (pgvector) + MinIO, waits for health
 make pipeline             # source system -> Bronze -> Silver -> warehouse -> DQ
 make rag-index            # chunk, mask, embed, upsert  (~3 min first run)
+make dbt-venv             # a second interpreter, for dbt only (see below)
+make gold                 # enrich -> snapshot backfill -> dbt run -> test -> record
 make rag-eval             # measure recall@5 against the golden set
 make test                 # the full suite
 ```
@@ -115,6 +117,12 @@ Then ask it something:
 make search Q="tracking has not updated in over a week"
 make ask    Q="why do customers ask for refunds?"
 ```
+
+dbt gets **its own virtualenv**, separate from `.venv`, and that is not tidiness.
+Airflow 3.1.3's constraints pin `protobuf==4.25.8` and dbt-core requires
+`protobuf>=6`; the two cannot be co-installed, and the Airflow image carries
+three interpreters for the same reason. Keeping the split locally means
+`make dbt-run` exercises the production arrangement rather than a friendlier one.
 
 `make verify` runs the whole chain from a cold start, which is the honest way to
 check any claim in this README. `make reset` destroys the volumes so
@@ -203,6 +211,67 @@ that table. Those lines are perfectly valid and will silently disappear from any
 join to `dim_product`. Blocking the pipeline would be wrong. Saying nothing would
 be worse. So it runs at WARN with a 3% tolerance, sized to pass today and fire if
 product rejection meaningfully worsens.
+
+---
+
+## The Gold layer
+
+`gold_stg` → `gold_int` → `gold`, built by dbt. Staging and intermediate are
+views; the dims, facts and marts are tables, because the dashboard queries them
+directly and a view would re-run the whole join graph on every page load.
+
+**The grain is split, and this is the first schema question anyone will ask.**
+`fact_orders` is at order-header grain and `fact_order_items` at line grain.
+Header-only makes `dim_product` unjoinable and kills "top products"; line-only
+forces `count(distinct order_id)` into every revenue and AOV query. The split
+costs one small model and makes both correct. `revenue_reconciles_across_grains`
+is the singular test that keeps them honest — they agree to the cent, and
+neither fans out.
+
+**`dim_customer` is SCD2 and actually has history in it.** That took more than
+adding a snapshot. dbt's snapshot records what it sees when it runs, and
+`silver.customers` holds current state — so a first run gives one version per
+customer, `is_current` is true everywhere, and all three SCD2 tests pass against
+a dimension containing no history at all. `scripts/dbt_snapshot_backfill.sh`
+replays `silver.customer_change_log` through the snapshot one transition at a
+time, overriding `snapshot_get_time()` so `dbt_valid_from` carries the date the
+tier actually changed rather than the date somebody ran the backfill.
+
+The result, for the designated demo customer:
+
+```
+customer_id  loyalty_tier  valid_from              valid_to
+C000042      silver        2025-02-07 12:00:00+00  2025-09-05 12:00:00+00
+C000042      gold          2025-09-05 12:00:00+00  2026-04-03 12:00:00+00
+C000042      platinum      2026-04-03 12:00:00+00  infinity
+```
+
+`hard_deletes='new_record'` gives the deleted customer a tombstone version
+instead of leaving their last one marked current forever. Under dbt's default
+the dimension goes on asserting a departed customer is live — a failure with no
+error message attached to it.
+
+Facts join to the customer version **that was current when the event happened**,
+which is the entire reason a type-2 dimension exists. Joining on `is_current`
+instead is invisible: the numbers still add up, they are just answers to a
+different question.
+
+**Non-additive measures carry an `nadd_` prefix** — `nadd_aov`,
+`nadd_auth_rate`, `nadd_retention_pct`. A ratio summed across a filter is the
+most common silent dashboard bug there is. The convention is enforced by a test
+that reads the information schema, because a naming convention nothing checks is
+a comment.
+
+`mart_support_health` reads the AI enrichment columns structurally, so the AI
+layer cannot quietly become a side attachment nothing consumes. Without an
+`ANTHROPIC_API_KEY` those columns are null and the mart reports 0% coverage with
+null accuracies — "we did not ask" rather than "the model was wrong".
+
+87 dbt assertions run in `dbt_test`, and `meridian.dbt.results` parses
+`run_results.json` into `meta.dq_check_results` with `source='dbt'` — so
+Pandera, custom SQL and dbt findings are all queryable from one table. That step
+runs on `all_done`, because a failing test suite is exactly when the record
+matters.
 
 ---
 
@@ -323,7 +392,22 @@ src/meridian/
     index.py        chunk → mask → hash → embed → upsert
     retrieve.py     BM25 + vector, fused with RRF in one statement
     generate.py     claude-opus-5, adaptive thinking, extractive fallback
+    enrich.py       classify tickets from masked text; no-ops without an API key
     evaluate.py     recall@5 with a chance baseline and per-strategy breakdown
+  dbt/
+    results.py      dbt run_results.json -> meta.dq_check_results, source='dbt'
+dbt/                the transform project, run from its own interpreter
+  models/staging/   9 views — the only place that knows physical source names
+  models/intermediate/  rollups, the session funnel, the point-in-time rebuild
+  models/marts/     3 dims, 5 facts, 7 marts
+  snapshots/        the SCD2 customer snapshot
+  tests/            6 singular tests: SCD2, grain reconciliation, fan-out
+  macros/           schema naming, surrogate keys, snapshot time, composite-key uniqueness
+scripts/
+  dbt_snapshot_backfill.sh  one-time change-log replay. Guarded; not an Airflow task
+airflow/
+  Dockerfile        three isolated interpreters in one image
+  dags/             meridian_batch (14 tasks) and meridian_rag (asset-scheduled)
 tests/              acceptance tests; DB-backed ones skip when the stack is down
 ```
 
@@ -338,7 +422,8 @@ A map of each concept to the file that demonstrates it lives in
 | --- | --- |
 | Interface contracts | `docs/CONTRACTS.md` |
 | Deterministic test data | `src/meridian/seed/` |
-| Slowly Changing Dimension Type 2 | `seed/config.py` transitions → `dim_customer` (Phase 4) |
+| Slowly Changing Dimension Type 2 | `dbt/snapshots/`, `dbt/models/marts/dim_customer.sql` |
+| Backfilling SCD2 history from a change log | `scripts/dbt_snapshot_backfill.sh`, `macros/snapshot_get_time.sql` |
 | PII classification and masking | `docs/governance/pii_classification.yml`, `seed/identity.py` |
 | Data quality by design | `seed/defects.py` — known-bad rows for the DQ suite to catch |
 | Kafka partitioning strategy | `contracts/topics.yml` |
@@ -361,6 +446,13 @@ A map of each concept to the file that demonstrates it lives in
 | Orchestration without import coupling | `airflow/dags/`, `airflow/Dockerfile` |
 | Dependency isolation by interpreter | `airflow/Dockerfile` — protobuf 4.25.8 vs 6.33.6 |
 | Data-aware (asset) scheduling | `airflow/dags/meridian_rag.py` |
+| Star schema with a split fact grain | `dbt/models/marts/fact_orders.sql`, `fact_order_items.sql` |
+| As-of joins against a type-2 dimension | every fact — `order_ts BETWEEN valid_from AND valid_to` |
+| Additivity as an enforced convention | the `nadd_` prefix, `tests/test_gold.py` |
+| Gap-free date spine | `dbt/models/marts/dim_date.sql`, `mart_daily_sales.sql` |
+| Session-grain funnel (not event counts) | `dbt/models/intermediate/int_session_funnel.sql` |
+| Cross-tool test results in one table | `src/meridian/dbt/results.py` |
+| LLM enrichment scored against ground truth | `rag/enrich.py`, `mart_support_health.sql` |
 
 ---
 

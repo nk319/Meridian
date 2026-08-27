@@ -10,11 +10,11 @@ history, which does not survive a container restart.
 
 | | |
 | --- | --- |
-| **Phase** | 3 — Data quality suites and orchestration |
+| **Phase** | 4 — dbt Gold star schema |
 | **Status** | ✅ Complete |
-| **Tag** | `phase-3` — needs a human to push it, see below |
-| **Next phase** | 4 — dbt Gold star schema |
-| **Next action** | Build the dbt project: `gold_stg` → `gold_int` → `gold`, with `dim_customer` as an SCD2 snapshot and the split order-header / order-line fact grains (CONTRACTS.md §8). dbt is already installed at `/opt/dbt-venv` in the Airflow image; add `dbt_run` and `dbt_test` tasks to `meridian_batch` after `data_quality`. |
+| **Tag** | `phase-3` and `phase-4` — both need a human to push them, see below |
+| **Next phase** | 5 — Redpanda streaming |
+| **Next action** | Generate topics from `contracts/topics.yml`, build the producer, and run two independent consumer groups (`bronze-sink` with manual commit after persist, `realtime-metrics` with its own offsets) plus a DLQ, recording lag in `meta.kafka_consumer_offsets` (CONTRACTS.md §4). The table already exists; nothing writes to it yet. |
 
 ### What this session can and cannot push
 
@@ -48,8 +48,17 @@ Practical consequences for a future session:
   annotated; a future phase's tag will need the same treatment:
 
   ```bash
-  git tag -a phase-N <sha> -m "Phase N: ..."
-  git push origin refs/tags/phase-N
+  git fetch origin
+  git push origin refs/tags/phase-3 refs/tags/phase-4
+  ```
+
+  Both tags already exist locally in this session's clone but cannot leave it.
+  To recreate them from scratch in your own clone:
+
+  ```bash
+  git tag -a phase-3 bed3a3f -m "Phase 3: data quality suites and orchestration"
+  git tag -a phase-4 4d849e6 -m "Phase 4: dbt Gold star schema"
+  git push origin refs/tags/phase-3 refs/tags/phase-4
   ```
 
 The branch `claude/phase-1-setup-8lokjp` carries every phase. (The name is Phase
@@ -246,31 +255,96 @@ ruff check + ruff format       # clean
 
 ---
 
-## Phase 4 — dbt Gold star schema (next)
+## Phase 4 — complete
 
 **Goal:** `gold_stg` → `gold_int` → `gold`, read by nothing but the dashboard.
 
-**Planned deliverables**
+### Delivered
 
-- dbt project run from `/opt/dbt-venv/bin/dbt` by absolute path (already in the image)
-- `dim_date`, `dim_customer` (SCD2 snapshot, `check` strategy on `loyalty_tier`
-  and `segment`, `hard_deletes='new_record'`), `dim_product`
-- `fact_orders` at **order-header** grain and `fact_order_items` at **line**
-  grain — §8 resolves that split and expects it as the first interview question
-- `fact_payments`, `fact_web_events`, `fact_support_tickets`
-- The seven marts from §8, with the `nadd_` prefix on every non-additive measure
-- Three singular tests on the SCD2 dimension: no overlapping validity windows,
-  exactly one `is_current` per customer, and demo customer `C000042` with
-  exactly three versions
-- `dbt run` / `dbt test` tasks appended to `meridian_batch`
-- dbt `run_results.json` parsed into `meta.dq_check_results` with `source='dbt'`
+| Artifact | What it does |
+| --- | --- |
+| `dbt/models/staging/` | 9 views, one per source relation. The only place that knows physical source names |
+| `dbt/models/intermediate/` | 5 models: order/payment/line rollups, the session funnel, the point-in-time customer rebuild |
+| `dbt/models/marts/` | 3 dims, 5 facts, 7 marts — the fifteen relations §8 names |
+| `dbt/snapshots/customers_snapshot.sql` | SCD2, `check` on `loyalty_tier`+`segment`, `hard_deletes='new_record'` |
+| `dbt/tests/` | 6 singular tests: four on SCD2, one reconciling the two order grains, one on fan-out |
+| `dbt/macros/` | `generate_schema_name`, `surrogate_key`, `snapshot_get_time`, `unique_combination_of_columns` |
+| `scripts/dbt_snapshot_backfill.sh` | One-time replay of the change log into the snapshot. Guarded, and NOT an Airflow task |
+| `src/meridian/dbt/results.py` | `run_results.json` → `meta.dq_check_results` with `source='dbt'` |
+| `src/meridian/rag/enrich.py` | The last §5 entrypoint. Classifies from masked text; no-ops without an API key |
+| `src/meridian/seed/anchors.py` | Publishes the values the golden eval set needs to name |
+| `tests/test_gold.py`, `tests/test_dbt_results.py` | 30 further tests |
 
-**Watch for:** the generator emits `C000042` with three backdated tier
-transitions and hard-deletes `C000117` precisely so the snapshot is exercised. A
-snapshot over static data produces one version per customer and its tests pass
-against an empty result set.
+### Acceptance — met
 
----
+```
+87 dbt tests                   # PASS=87 WARN=0 ERROR=0 SKIP=0
+218 pytest                     # stack up, no ANTHROPIC_API_KEY
+38 DQ checks, 0 failing
+ruff check + ruff format       # clean
+recall@5: hybrid 1.00 / lexical 1.00 / vector 0.91, abstention 1.00
+```
+
+`dim_customer` holds 3,003 rows for 3,000 customers: `C000042` has exactly three
+versions with event-time validity windows, and `C000117` has a live version
+closed at its deletion plus a tombstone. Both order grains reconcile to the
+cent. No fact fans out.
+
+### Decisions taken
+
+| Decision | Reasoning |
+| --- | --- |
+| The snapshot is **backfilled from the change log**, once | A snapshot records what it sees when it runs, and `silver.customers` holds current state — so a first run gives one version per customer and §8's three SCD2 tests all pass against a dimension with no history. `snapshot_get_time()` is overridden so a replayed checkpoint stamps `dbt_valid_from` with the date the tier actually changed, not the date somebody ran the backfill. |
+| The backfill is **guarded, not idempotent** | Replaying an old checkpoint after the snapshot reaches the present sees the customer's *old* tier, treats it as a fresh change, and appends a version recording time running backwards. A snapshot cannot see its own history, so the check cannot live inside it. |
+| `dim_customer` version 1 opens at `-infinity` | SCD2 history starts at the first change log entry (2025-02-07); orders start 2024-08-20. A straight `BETWEEN` join would drop six months of revenue with no error — an inner join to a dimension is exactly as quiet as a filter. |
+| `valid_to` is `infinity`, not null | A null is more honest and costs a `coalesce` in every as-of join, which is one somebody eventually forgets. |
+| `date_sk` is `yyyymmdd`, the only non-hashed key | A date's natural key is already unique, immutable, dense and orderable. Hashing throws all four away to buy consistency with dimensions that have none of them. |
+| The enrichment lands in `rag`, not `silver` | §8 makes the mart depend on it and §1 says dbt reads silver — both cannot hold. The alternative makes `rag_indexer` a writer of `silver` and puts a model's output in a layer defined as cleaned source data. |
+| `dbt_results` runs on `all_done` | Its whole job is recording what dbt found, and a failing `dbt test` is exactly when that matters. The `GOLD_READY` asset hangs off `dbt_test` instead, so a red suite does not wake consumers. |
+| `unique_combination_of_columns` written locally | dbt_utils has it, and taking the dependency means a network fetch before the project compiles. Fourteen lines keeps the whole project buildable offline. |
+| `error` and `skipped` map to **FAIL** | A test that could not run has not passed. Recording it PASS is how a test broken by a compilation error stays broken for a quarter behind a green dashboard. |
+
+### Bugs found and fixed
+
+| Bug | How it surfaced |
+| --- | --- |
+| **The hard-deleted customer was deleted four months before they signed up.** `enrich_customers` forced the SCD2 demo customer's signup to precede its first transition but left the deleted customer's to the random skew. | Every point-in-time reconstruction correctly excluded `C000117` at every date, so the row never entered the snapshot and `hard_deletes='new_record'` — the whole reason the customer exists — was never exercised. The seed was wrong in a way that made the feature it demonstrates silently untested. |
+| **`dbt snapshot` could not create temporary tables.** | `db/init` revokes ALL on the database from PUBLIC, which takes away the default TEMP grant. A role owning three schemas still cannot run a snapshot. Caught on the second backfill checkpoint, because the first run of a snapshot does not stage. |
+| **Every singular dbt test was recorded under the name `meridian`.** | `unique_id` is `test.<project>.<name>.<hash>` for a generic test and `test.<project>.<name>` for a singular one. A fixed offset from the end gets one shape right; the six most interesting assertions in the project all shared one name in `meta.dq_check_results`. |
+| **The golden eval set named an order reference that no longer existed.** | The seed fix above shifted the order sequence, and three retrieval tests failed for a reason unrelated to retrieval. `build_relevance` refused to score the question rather than silently returning 0 — the Phase 1 guard working — but the obvious repair was to paste in another literal and restart the same clock. The generator now publishes its anchors. |
+| **A load-bearing claim about the rankers was false.** The test asserting "vector search finds a bare rare identifier at rank 1 and only loses it when the query dilutes it" was written against one hand-picked order. | Measured over twelve: BM25 ranks the right ticket first 12/12 in both phrasings; vector manages **2/12 bare** and **4/12 diluted**. Order references share a prefix and differ only in digits, so they embed to nearly the same point — dilution makes it worse but is not the mechanism. |
+
+### Measured, and left alone
+
+**Fusion keeps 10 of those 12, not all of them, and that is RRF working as
+designed.** A document one ranker puts first and the other misses scores
+`1/(k+1)` = 0.0164; a document *both* rank badly — 27th and 36th — scores
+`1/87 + 1/96` = 0.0219 and wins. What sharpens it here is that `k` (60) is
+**larger than `RAG_CANDIDATE_POOL` (50)**: the entire rank curve spans 1/61 to
+1/111, under a factor of two, so appearing on both lists outweighs rank
+position almost everywhere.
+
+Not retuned. §11 freezes `k=60` and gives the reason — RRF's appeal is needing
+no per-corpus calibration, and a `k` fitted to this seed is exactly that
+calibration. `tests/test_rag_retrieval.py` asserts the cost (fusion must keep
+≥ 3/4) and asserts the benefit (hybrid must beat vector alone) instead of
+hiding either. **If Phase 7 or a later phase wants identifier lookup to be
+exact, the fix is a direct `ticket_id`/`order_id` lookup path, not a tuned `k`.**
+
+### Loose ends closed from earlier phases
+
+- `ticket_status` and `ticket_channel` promoted into CONTRACTS §9, as the
+  deviations table said Phase 4 would.
+- `python -m meridian.rag.enrich` built — the last §5 command that did not exist.
+- dbt telemetry disabled (`send_anonymous_usage_stats: false`), so the project
+  compiles on a machine with no outbound network.
+
+### Still open
+
+- `mart_support_health` reports `nadd_ai_coverage_pct` of 0.00 because no
+  `ANTHROPIC_API_KEY` is configured here. The join, the agreement flags and the
+  null-safe accuracy denominators are all exercised; only the model call is not.
+  Setting a key and running `make rag-enrich` populates it with no code change.
 
 ---
 
