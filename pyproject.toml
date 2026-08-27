@@ -36,6 +36,20 @@ stream = [
     # encode this does thousands of times, and ships manylinux wheels.
     "fastavro>=1.9",
 ]
+# Phase 6. Optional like the others: the batch platform, the lake and the
+# warehouse are all complete without an HTTP server, and someone running the
+# pipeline should not be made to install uvicorn to do it.
+api = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    # PyJWT rather than python-jose: fewer transitive dependencies, and it is
+    # the library that refuses `algorithms=None` outright rather than making
+    # the caller remember to pass a list.
+    "PyJWT>=2.9",
+    # The client the REST ingestor uses to walk the live feed, and what
+    # fastapi.testclient needs to exist at all.
+    "httpx>=0.27",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
@@ -86,3 +100,18 @@ exclude = [
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["E501"]
+
+[tool.ruff.lint.flake8-bugbear]
+# B008 flags a function call in an argument default, which is normally a bug —
+# the call happens once, at import, and every caller shares the result. FastAPI
+# inverts that deliberately: `Query(...)`, `Depends(...)` and `Header(...)` are
+# markers it reads off the signature to build the dependency graph, and moving
+# them into the body is what would break. Narrowly listed rather than disabling
+# B008, so a genuine mutable default elsewhere still fails.
+extend-immutable-calls = [
+    "fastapi.Query",
+    "fastapi.Depends",
+    "fastapi.Header",
+    "fastapi.Path",
+    "fastapi.Body",
+]

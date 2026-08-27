@@ -4,7 +4,7 @@
         rag-index rag-reindex rag-eval rag-enrich ask search verify \
         dbt-venv dbt-run dbt-test dbt-snapshot dbt-snapshot-backfill dbt-results dbt-docs gold \
         stream-up stream-down stream-topics stream-produce stream-consume stream-lag \
-        stream-dlq stream-demo
+        stream-dlq stream-demo api api-up api-down api-token api-demo
 
 # Prefer the project venv when one exists. The RAG layer needs psycopg,
 # fastembed and pgvector; the seed generator is stdlib-only and runs anywhere.
@@ -103,6 +103,25 @@ airflow-logs:  ## Tail the scheduler
 airflow-test:  ## Parse the DAGs and report import errors
 	docker compose --profile full run --rm airflow-init bash -c \
 	  "airflow dags list && airflow dags list-import-errors"
+
+# --------------------------------------------------------------------------
+# The API. CONTRACTS.md §1 and §5.
+# --------------------------------------------------------------------------
+api:  ## Run the API on the host, with reload. http://localhost:8000/docs
+	$(PY) -m uvicorn meridian.api.main:app --reload --host 0.0.0.0 --port $(or $(API_PORT),8000)
+
+api-up:  ## Run the API in a container (needs `make airflow-build` for the image)
+	docker compose --profile api up -d --wait api
+	@echo "API on http://localhost:$(or $(API_PORT),8000)/docs"
+
+api-down:  ## Stop the containerised API
+	docker compose --profile api down
+
+api-token:  ## Print a bearer token. Usage: eval $$(make -s api-token)
+	@$(RUN) -m meridian.api.token
+
+api-demo:  ## Exercise every endpoint against a running API
+	$(RUN) -m meridian.api.demo
 
 # --------------------------------------------------------------------------
 # Streaming. CONTRACTS.md §4.

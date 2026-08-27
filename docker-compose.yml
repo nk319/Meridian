@@ -123,6 +123,62 @@ services:
     restart: "no"
 
   # --------------------------------------------------------------------------
+  # The platform's own API. CONTRACTS.md §1 and §5.
+  #
+  # Reuses the Airflow image rather than building a second one. That image
+  # already carries the pipeline in /opt/meridian-venv with the `rag` and
+  # `stream` extras, and a separate 4 GB image differing only in its entrypoint
+  # would double the build for nothing. The API runs from the same interpreter
+  # every Airflow task shells out to, which is also the honest arrangement: they
+  # are the same codebase.
+  #
+  # An `api` profile as well as `full`, so the service can be run without
+  # standing up a broker and four Airflow containers alongside it.
+  # --------------------------------------------------------------------------
+  api:
+    image: meridian-airflow:3.1.3
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    profiles: [api, full]
+    container_name: meridian-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MERIDIAN_ROOT: /opt/meridian
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      MERIDIAN_APP_PASSWORD: ${MERIDIAN_APP_PASSWORD}
+      ANALYTICS_RO_PASSWORD: ${ANALYTICS_RO_PASSWORD}
+      API_JWT_SECRET: ${API_JWT_SECRET:?set API_JWT_SECRET in .env}
+      API_JWT_EXPIRY_MINUTES: ${API_JWT_EXPIRY_MINUTES:-60}
+      API_INGEST_KEY: ${API_INGEST_KEY:?set API_INGEST_KEY in .env}
+      # No default. api/routers/auth.py returns 503 rather than accepting a
+      # credential committed to a repository.
+      API_DEMO_PASSWORD: ${API_DEMO_PASSWORD:-}
+      API_DEMO_USERS: ${API_DEMO_USERS:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
+      RAG_ABSTAIN_SIMILARITY: ${RAG_ABSTAIN_SIMILARITY:-0.68}
+    command: >-
+      /opt/meridian-venv/bin/python -m uvicorn meridian.api.main:app
+      --host 0.0.0.0 --port 8000
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      # /health, not /ready. Liveness must not fail because the vector store is
+      # empty — a restart does not index a corpus, so a readiness condition in a
+      # liveness probe is a restart loop.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 90s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
   # Redpanda — Kafka wire protocol, single node. CONTRACTS.md §4.
   #
   # The flags are not optional and the first one is not cosmetic. Redpanda is
