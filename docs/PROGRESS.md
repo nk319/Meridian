@@ -10,11 +10,11 @@ history, which does not survive a container restart.
 
 | | |
 | --- | --- |
-| **Phase** | 5 — Redpanda streaming |
+| **Phase** | 6 — FastAPI service |
 | **Status** | ✅ Complete |
-| **Tag** | `phase-3`, `phase-4`, `phase-5` — all need a human to push them, see below |
-| **Next phase** | 6 — FastAPI service |
-| **Next action** | Build the FastAPI app: support-ticket endpoints writing to `oltp` as `meridian_app`, `/v1/ai/*` over the Phase 1 RAG layer reading as `analytics_ro`, JWT auth and a separate ingest key (CONTRACTS.md §5 and §13). `meridian.ingest.restapi` currently reads a JSON document — Phase 6 is when it reads the real service. |
+| **Tag** | `phase-3` … `phase-6` — all need a human to push them, see below |
+| **Next phase** | 7 — Streamlit dashboard |
+| **Next action** | Build the dashboard: reads **only** `gold`, and only through `dashboard/metrics.py`; cache key is `meta.pipeline_run_log.completed_at`; a stale-watermark warning banner; Playwright screenshots (CONTRACTS.md §7 and §8). Every `nadd_` column must be recomputed after aggregation rather than summed — `tests/test_gold.py` enforces the prefix, and the dashboard is what has to honour it. |
 
 ### What this session can and cannot push
 
@@ -49,17 +49,18 @@ Practical consequences for a future session:
 
   ```bash
   git fetch origin
-  git push origin refs/tags/phase-3 refs/tags/phase-4 refs/tags/phase-5
+  git push origin refs/tags/phase-3 refs/tags/phase-4 refs/tags/phase-5 refs/tags/phase-6
   ```
 
-  All three tags already exist locally in this session's clone but cannot leave it.
+  All four tags already exist locally in this session's clone but cannot leave it.
   To recreate them from scratch in your own clone:
 
   ```bash
   git tag -a phase-3 bed3a3f -m "Phase 3: data quality suites and orchestration"
   git tag -a phase-4 4d849e6 -m "Phase 4: dbt Gold star schema"
   git tag -a phase-5 1c0fce3 -m "Phase 5: Redpanda streaming"
-  git push origin refs/tags/phase-3 refs/tags/phase-4 refs/tags/phase-5
+  git tag -a phase-6 92c3429 -m "Phase 6: FastAPI service"
+  git push origin refs/tags/phase-3 refs/tags/phase-4 refs/tags/phase-5 refs/tags/phase-6
   ```
 
 The branch `claude/phase-1-setup-8lokjp` carries every phase. (The name is Phase
@@ -431,6 +432,72 @@ downstream; a counter has no such recourse. Exactly-once would need the offset
 committed in the same Postgres transaction as the metric — a transactional
 outbox keyed on the offset, which is a real design and a much larger one than a
 demonstration of consumer-group semantics warrants.
+
+---
+
+## Phase 6 — complete
+
+**Goal:** the platform's own REST API — the source system `meridian.ingest.restapi`
+captures from, and `/v1/ai/*` over the Phase 1 RAG layer.
+
+### Delivered
+
+| Artifact | What it does |
+| --- | --- |
+| `src/meridian/api/security.py` | JWT issue/verify, scopes, scrypt passwords, constant-time key comparison |
+| `src/meridian/api/deps.py` | The role a handler connects as, and who may call what |
+| `src/meridian/api/models.py` | Request/response shapes; §9 vocabularies imported, not restated |
+| `src/meridian/api/routers/auth.py` | `POST /v1/auth/token`, with scope narrowing |
+| `src/meridian/api/routers/tickets.py` | List (keyset-paginated), get, create, patch |
+| `src/meridian/api/routers/ai.py` | `GET /v1/ai/search`, `POST /v1/ai/ask` |
+| `src/meridian/api/main.py` | The app, a soft-failing lifespan, `/health` and `/ready` |
+| `src/meridian/api/token.py` | `eval $(make -s api-token)` |
+| `src/meridian/api/demo.py` | Walks every endpoint over the network |
+| `tests/test_api.py` | 24 tests; the auth half needs no database |
+
+### Acceptance — met
+
+```
+250 pytest                     # stack up, broker up, no ANTHROPIC_API_KEY
+ruff check + ruff format       # clean
+make api-demo                  # 17 steps, 0 failures, over the network
+```
+
+End to end through the API: a full `restapi` capture read **1,313** tickets over
+HTTP into Bronze, and an incremental one picked up exactly the **6** created
+since the watermark.
+
+### Decisions taken
+
+| Decision | Reasoning |
+| --- | --- |
+| The connecting role is chosen by the **dependency**, not the handler | `meridian_app` for tickets, `analytics_ro` for `/v1/ai/*`. A handler that could pick its own would make §1 a convention rather than a property of the process. |
+| Two credentials, not one | A machine that must refresh a token every fifteen minutes is a machine that will eventually fail to. The ingest key is static and carries `tickets:write` only — it is the credential most likely to end up in a config file. |
+| Three scopes | Asking the model a question costs money and reading a ticket does not, and a single "authenticated" flag cannot express that. Three rather than fifteen, because a model nobody can hold in their head gets bypassed with a wildcard. |
+| No default credential, anywhere | With no `API_DEMO_PASSWORD`, `/v1/auth/token` returns 503. A hardcoded password in a repository is worse than no authentication, because it looks like authentication. |
+| Keyset pagination | Offset re-scans what it skips and silently repeats or drops rows while the table is being written to — the normal state for a ticket feed, not a corner case. The `ticket_id` tie-break is load-bearing: `created_ts` is not unique. |
+| `since` uses `>=`, not `>` | A watermark equal to the maximum `created_ts` seen would, with `>`, skip every other ticket sharing that second. The duplicate `>=` admits is free — Bronze is append-only and Silver dedups on the record hash. |
+| Callers cannot set `intent` or `sentiment` | They are the ground truth `mart_support_health` scores predictions against. A caller that could write them could write its own answer key. |
+| `/health` and `/ready` are different endpoints | Liveness answers "should this be restarted". A restart does not index a corpus, so a vector-store check in liveness is a restart loop — the most common way a deployment cycles healthy pods. |
+| Startup fails soft | A missing vector store leaves `/v1/ai/*` at 503 and the ticket endpoints working. Refusing to boot would let an unindexed corpus take down the source-system API, and those two have nothing to do with each other. |
+| One 500 shape, never the exception text | A stack trace in a response body leaks table names, file paths and sometimes parameter values. It is logged in full and the caller gets a run id to quote. |
+| The API reuses the Airflow image | That image already carries the pipeline with the `rag` and `stream` extras. A second 4 GB image differing only in its entrypoint would double the build for nothing — and they are genuinely the same codebase. |
+
+### Bugs found and fixed
+
+| Bug | How it surfaced |
+| --- | --- |
+| **The ticket handlers connected to the wrong database.** `connect()` defaults to `warehouse` and the first `oltp_connection` omitted the name. | Every ticket request returned `permission denied for database "warehouse"` — the grant boundary refusing correctly. Worth recording because the error names a database the endpoint has no business touching, which reads as a configuration problem rather than the correct refusal it is. |
+| **`API_JWT_SECRET` was 24 bytes.** | PyJWT warns below 32 for HS256, and it is right: RFC 7518 §3.2 sets the minimum HMAC key length at the hash output size. Regenerated, and `.env.example` now says so. |
+| **`order_id` was modelled as nullable.** | `db/init/05_oltp_ddl.sql` makes it `NOT NULL REFERENCES orders`, so the first create returned a `NotNullViolation` 500. A nullable field modelled a ticket the database cannot store. Now required, and a foreign-key violation is a 422 rather than an unhandled 500. |
+| **The NDJSON temp file leaked.** `NamedTemporaryFile(delete=False)` with no cleanup. | One file per ingest run left in `/tmp` — on a scheduled capture, a slow disk-space leak nothing attributes to this module. Replaced with a `TemporaryDirectory` the generator holds open across its `yield`. |
+
+### Loose ends closed from earlier phases
+
+- `meridian.ingest.restapi` reads the live service, which Phase 2 deferred to here.
+  Both paths end in the same `read_json`, so the transport is the only difference.
+- Ruff now knows FastAPI's `Query`/`Depends`/`Header` are not mutable defaults
+  (`extend-immutable-calls`), narrowly rather than by disabling B008.
 
 ---
 

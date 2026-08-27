@@ -104,6 +104,8 @@ make dbt-venv             # a second interpreter, for dbt only (see below)
 make gold                 # enrich -> snapshot backfill -> dbt run -> test -> record
 make stream-up            # Redpanda + the topics declared in contracts/topics.yml
 make stream-demo          # produce, consume with both groups, show lag and the DLQ
+make api                  # the REST API on :8000 — /docs is the OpenAPI browser
+make api-demo             # exercise every endpoint over the network
 make rag-eval             # measure recall@5 against the golden set
 make test                 # the full suite
 ```
@@ -422,6 +424,61 @@ that happens to work, not a calibrated one.
 
 ---
 
+## The API
+
+The platform's own source system, served over HTTP, and the AI layer over its
+ticket corpus. `/docs` is the generated OpenAPI browser.
+
+```
+POST   /v1/auth/token             issue a JWT; scopes narrowed to what the user holds
+GET    /v1/support/tickets        keyset-paginated feed — what the REST ingestor reads
+GET    /v1/support/tickets/{id}
+POST   /v1/support/tickets        ingest key or a tickets:write token
+PATCH  /v1/support/tickets/{id}
+GET    /v1/ai/search              hybrid retrieval, with the per-ranker breakdown
+POST   /v1/ai/ask                 answer from the corpus, or abstain
+GET    /health                    liveness  — no database call, deliberately
+GET    /ready                     readiness — each dependency reported separately
+```
+
+**The role a handler connects as is the security boundary, and the dependency
+chooses it, not the handler.** Ticket endpoints connect as `meridian_app`: CRUD
+on `oltp`, no warehouse access at all. Every `/v1/ai/*` handler connects as
+`analytics_ro`: SELECT on `gold`, `rag` and `meta`, and nothing on `secure`,
+`oltp` or `silver`.
+
+The consequence is worth stating plainly. A request to `/v1/ai/ask` runs in a
+database session that is **incapable** of reading a customer's email address —
+not "does not", cannot. A prompt injection that talked the model into asking for
+PII would get `InsufficientPrivilege` from Postgres.
+
+**Two credentials, for two kinds of caller.** A short-lived JWT with three
+scopes for interactive clients; a static `X-Ingest-Key` for the ticketing
+system, which carries `tickets:write` and nothing else — it is the credential
+most likely to end up in a config file, so it must not also be able to read the
+corpus or spend model tokens.
+
+There is no default credential anywhere. With no `API_DEMO_PASSWORD` set,
+`/v1/auth/token` returns 503 rather than accepting a password committed to a
+public repository.
+
+**Pagination is keyset, not offset.** `(created_ts, ticket_id) > (?, ?)` is one
+index-friendly row-value predicate. Offset re-scans everything it skips, and
+silently repeats or drops rows when a row is inserted between two requests —
+which for a ticket feed being written to continuously is the normal state.
+
+The API is also where the Phase 2 loop closes: `meridian.ingest.restapi` reads
+the live feed when `MERIDIAN_API_URL` is set and `seeds/` otherwise, and both
+paths end in the same `read_json`, so nothing downstream can tell which ran.
+
+```bash
+make api &                       # or `make api-up` for the containerised one
+eval $(make -s api-token)        # exports MERIDIAN_API_TOKEN and MERIDIAN_API_URL
+python -m meridian.ingest.restapi --mode incremental   # captures over HTTP
+```
+
+---
+
 ## Repository layout
 
 ```
@@ -473,6 +530,14 @@ src/meridian/
     evaluate.py     recall@5 with a chance baseline and per-strategy breakdown
   dbt/
     results.py      dbt run_results.json -> meta.dq_check_results, source='dbt'
+  api/
+    security.py     JWT, scopes, scrypt passwords, constant-time comparison
+    deps.py         the role each handler connects as, and who may call what
+    models.py       request/response shapes; §9 vocabularies imported, not restated
+    routers/        auth, tickets, ai
+    main.py         the app; /health and /ready are deliberately different
+    token.py        `eval $(make -s api-token)`
+    demo.py         walks every endpoint over the network
   stream/
     topics.py       the manifest loader; the only place a topic is named
     client.py       client config and Avro single-object framing
@@ -546,6 +611,11 @@ A map of each concept to the file that demonstrates it lives in
 | Gap-free date spine | `dbt/models/marts/dim_date.sql`, `mart_daily_sales.sql` |
 | Session-grain funnel (not event counts) | `dbt/models/intermediate/int_session_funnel.sql` |
 | Cross-tool test results in one table | `src/meridian/dbt/results.py` |
+| Least privilege enforced per HTTP handler | `api/deps.py`, `tests/test_api.py` |
+| JWT scopes, and the `alg:none` forgery | `api/security.py`, `tests/test_api.py` |
+| Keyset (cursor) pagination | `api/routers/tickets.py` |
+| Liveness vs. readiness | `api/main.py` — `/health` makes no database call |
+| One transport swapped under a fixed contract | `ingest/restapi.py` — file or HTTP |
 | LLM enrichment scored against ground truth | `rag/enrich.py`, `mart_support_health.sql` |
 
 ---
