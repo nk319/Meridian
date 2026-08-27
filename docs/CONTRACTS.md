@@ -52,20 +52,22 @@ Bronze is **not** a Postgres schema. Bronze lives only in object storage as Parq
 | Role              | Grants                                                       |
 | ----------------- | ------------------------------------------------------------ |
 | `meridian_app`    | CRUD on `oltp.*`. No warehouse access.                       |
-| `meridian_etl`    | Read `oltp.*`; write `silver.*`, `secure.*`, `meta.*`.       |
+| `meridian_etl`    | Read `oltp.*`; **owns** `silver`, `secure`, `meta`.          |
 | `dbt_runner`      | Owns `gold_stg`, `gold_int`, `gold`. Reads `silver`.         |
-| `analytics_ro`    | **SELECT on `gold` and on `rag`.** No `secure`, no `oltp`, no `silver`. |
+| `analytics_ro`    | **SELECT on `gold`, `rag` and `meta`.** No `secure`, no `oltp`, no `silver`. |
 | `rag_indexer`     | Read `silver.support_*`; write `rag.*`. **No `secure` grant.** |
 
 `analytics_ro` is what the Streamlit dashboard and every `/v1/ai/*` handler connect
 as. `tests/test_pii_boundary.py` asserts `InsufficientPrivilege` when that role
 selects a PII column. That test is the governance requirement's only actual proof.
 
-The `rag` grant was added in Phase 1 and is a correction, not a widening: this
-document already made `analytics_ro` the role the AI handlers connect as, and
-those handlers read `rag.chunks`, so "SELECT on `gold` only" and "the role every
-`/v1/ai/*` handler uses" could never both be true. `rag` holds masked text by
-construction (§11). The `secure` grant is unchanged — still none.
+The `rag` and `meta` grants were added in Phases 1 and 2 and are corrections,
+not widenings. This document already made `analytics_ro` the role the AI
+handlers connect as, and those handlers read `rag.chunks`; §7 already said the
+dashboard's cache key reads `meta.pipeline_run_log.completed_at`, and the
+dashboard connects as the same role. "SELECT on `gold` only" could not coexist
+with either. `rag` holds masked text by construction (§11) and `meta` holds ops
+metadata; neither holds PII. The `secure` grant is unchanged — still none.
 
 `ALTER DEFAULT PRIVILEGES` is set so dbt-created tables are readable by
 `analytics_ro` automatically, plus a belt-and-braces post-dbt `GRANT` task —
@@ -462,6 +464,90 @@ unrelated ticket, because rank carries no notion of closeness.
 
 ---
 
+## 12. The batch pipeline
+
+Added in Phase 2. §2 froze the Bronze layout and §3 the Silver→warehouse mover;
+this is what the implementation of those settled that also crosses a boundary.
+
+### One entity, one ingestion owner
+
+| Entity | Source |
+| --- | --- |
+| `customers`, `orders`, `order_items`, `customer_change_log` | `oltp` |
+| `products`, `web_events` | `files` |
+| `support_tickets` | `restapi` |
+| `payments` | `vendor` |
+
+`support_tickets` lives in the `oltp` database and is still ingested from
+`restapi`. That looks like an oversight and is not: an earlier design had one
+entity arriving over four paths at once, which double-counted it in Bronze and
+made the row-count reconciliation check fail permanently. The map above is
+`meridian.ingest.base.OWNERSHIP`, and `check_ownership` refuses the mistake at
+run time rather than leaving it to review.
+
+### Bronze is raw; typing happens in Silver
+
+The file, API and vendor feeds land as VARCHAR. They carry injected defects —
+malformed dates, invalid enums, blanked required fields — and an ingestion layer
+that typed on the way in would reject those rows at the door, leaving no
+distinction between a row that was refused and a row that was never sent. OLTP
+lands typed, because from a relational source a typed row *is* what was sent.
+
+### Silver carries four of the six Bronze columns
+
+`_source_system`, `_ingest_run_id`, `_ingested_at`, `_record_hash`.
+
+`_source_file` and `_batch_seq` stop at Bronze. They describe a physical file,
+and after dedup across runs a Silver row no longer corresponds to one — carrying
+them would mean picking an arbitrary winner's file name and calling it
+provenance.
+
+### Silver has no cross-table foreign keys
+
+A quarantined customer would make its orders unloadable, coupling every
+entity's load to every other entity's quarantine decisions. Referential
+integrity is asserted by dbt tests, where a violation is a reported failure
+rather than a hard stop halfway through a load. The CHECK constraints on
+vocabularies stay, because those are per-row and are what make Silver's
+"bad rows were quarantined" guarantee enforced rather than claimed.
+
+### Quarantine
+
+```
+s3://meridian-lake/quarantine/{entity}/ingest_date=YYYY-MM-DD/part-{run_id}.parquet
+```
+
+Rejected rows keep their **original** values plus one extra column,
+`_quarantine_reason`, formatted `rule:column` — one of `missing`, `bad_type`,
+`bad_enum`, `out_of_range`. Storing the cast values instead would fill the
+quarantine with NULLs exactly where the bad data used to be.
+
+Every rule writes a `meta.dq_check_results` row under suite `silver_build`, at
+severity `QUARANTINE`. One additional check per entity, `quarantine_rate`, runs
+at severity `BLOCK`: above 10% rejected the step exits 2 rather than publishing
+a Silver table that is missing most of its rows, which downstream reads as a
+business collapse rather than a pipeline failure.
+
+### Full rebuild, and what that implies about naming
+
+Silver is rebuilt from Bronze in full on every run, into a single
+`part-000.parquet` per entity that is replaced in place. Naming it by run id
+would leave every previous rebuild under the same glob, and the loader would
+then read every generation at once — a duplicate explosion that grows by one
+full copy per run and looks like a dedup bug rather than a naming one.
+
+### PII never enters the lake
+
+`secure.customer_pii` is loaded directly from the generated file by
+`meridian.lake.load_warehouse`, bypassing Bronze and Silver entirely. That is
+the enforcement mechanism from §10, not a shortcut: there is no stage that holds
+restricted data alongside business data, so there is no step that could forget
+to drop it. `build_silver.assert_no_restricted_columns` is the other half — it
+reads the restricted list from `pii_classification.yml` and fails the build if
+such a column ever appears in Bronze.
+
+---
+
 ## Deviations from the plan
 
 | Plan said        | Built as   | Why                                                    |
@@ -472,3 +558,8 @@ unrelated ticket, because rank carries no notion of closeness.
 | §9 has no `ticket_status` | `open`, `pending`, `resolved` | The source system has ticket lifecycle state and §9 never gave it a vocabulary. Enforced as a CHECK constraint in `db/init/05_oltp_ddl.sql`; promote to §9 when Phase 4 builds `fact_support_tickets`. |
 | §1: `rag_indexer` reads `silver.support_*` | schema USAGE only, so far | `silver.support_tickets` does not exist until Phase 2. Granting SELECT on all of `silver` now would be broader than the contract; the table-level grant is issued when the table is created. Phase 1 indexes from `seeds/` and needs no `silver` read at all. |
 | §7: one pipeline run log | plus `rag.index_runs` | Not a second run log. `meta.pipeline_run_log` has nowhere to record chunks skipped by content hash or PII hits split by masking pass, which are the numbers that say whether the indexer is working. `rag_indexer` is still granted nothing on `meta`. |
+| §1: `analytics_ro` has "SELECT on `gold` only" | `gold`, `rag` **and `meta`** | The second half of the same contradiction. §7 states the dashboard's cache key reads `meta.pipeline_run_log.completed_at`, and §1 makes `analytics_ro` the role the dashboard connects as. Read-only; `meta` holds no PII. The `secure` grant is still none. |
+| §1: `meridian_etl` writes `silver`, `secure`, `meta` | and **owns** those schemas | Writing was not enough. `src/meridian/warehouse/ddl.sql` has to `GRANT SELECT ON silver.support_tickets TO rag_indexer` — the narrow grant §1 specifies, which could not be issued in `db/init/04` because the table did not exist yet — and only a schema's owner can grant on the tables in it. Mirrors `dbt_runner` owning `gold*` and `rag_indexer` owning `rag`. |
+| §2: six Bronze metadata columns | four of them reach Silver | `_source_file` and `_batch_seq` describe a physical file. After dedup across runs a Silver row corresponds to no single file, so carrying them would mean presenting an arbitrary winner's filename as provenance. |
+| `order_items` as the source has it | Bronze also carries `order_ts` | The source table has no timestamp of its own, so without the parent order's it could only ever be full-refreshed — a full reload of the largest child table on every run is what incremental ingestion exists to avoid. Dropped again in Silver; it is capture machinery, not a business column. |
+| §9 has no `ticket_channel` | `email`, `chat`, `phone`, `web_form` | Same gap as `ticket_status`, and worse because the name collides: §9's frozen `channel` is the marketing channel on orders and web events. Both are enforced as CHECK constraints; promote both in Phase 4. |

@@ -11,6 +11,11 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pgvector>=0.3",
     "PyYAML>=6.0",
+    # The lake engine and the transport for the Silver->warehouse hop. Core
+    # rather than optional: without them Bronze and Silver are unreadable, since
+    # dbt-postgres cannot read Parquet from object storage (CONTRACTS.md §3).
+    "duckdb>=1.0",
+    "pyarrow>=15.0",
 ]
 
 [project.optional-dependencies]

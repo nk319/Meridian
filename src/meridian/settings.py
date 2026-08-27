@@ -85,6 +85,11 @@ class Settings:
     pg_superuser: str
     pg_superuser_password: str
 
+    minio_endpoint: str
+    minio_access_key: str
+    minio_secret_key: str
+    lake_bucket: str
+
     embedding_model: str
     anthropic_model: str
     anthropic_api_key: str
@@ -105,6 +110,15 @@ class Settings:
     @property
     def seeds_dir(self) -> Path:
         return self.root / "seeds"
+
+    @property
+    def minio_host(self) -> str:
+        """Endpoint without the scheme, which is the form DuckDB's S3 secret wants."""
+        return self.minio_endpoint.replace("https://", "").replace("http://", "")
+
+    @property
+    def minio_use_ssl(self) -> bool:
+        return self.minio_endpoint.startswith("https://")
 
     @property
     def has_anthropic_key(self) -> bool:
@@ -138,6 +152,10 @@ def settings() -> Settings:
         pg_port=_int("POSTGRES_PORT", 5432),
         pg_superuser=os.environ.get("POSTGRES_SUPERUSER", "postgres"),
         pg_superuser_password=os.environ.get("POSTGRES_SUPERUSER_PASSWORD", ""),
+        minio_endpoint=os.environ.get("MINIO_ENDPOINT", "http://localhost:9000"),
+        minio_access_key=os.environ.get("MINIO_ROOT_USER", ""),
+        minio_secret_key=os.environ.get("MINIO_ROOT_PASSWORD", ""),
+        lake_bucket=os.environ.get("LAKE_BUCKET", "meridian-lake"),
         embedding_model=os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
         anthropic_model=os.environ.get("ANTHROPIC_MODEL", "claude-opus-5"),
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),

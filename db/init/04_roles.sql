@@ -100,8 +100,14 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 
 \connect warehouse
 
--- meridian_etl writes the landing schemas.
-GRANT USAGE, CREATE ON SCHEMA silver, secure, meta TO meridian_etl;
+-- meridian_etl owns the three schemas it writes, mirroring dbt_runner owning
+-- gold* and rag_indexer owning rag. Ownership rather than USAGE+CREATE because
+-- the component that writes a schema also has to be able to GRANT on the tables
+-- it creates there — src/meridian/warehouse/ddl.sql issues exactly two such
+-- grants, and a non-owner cannot.
+ALTER SCHEMA silver OWNER TO meridian_etl;
+ALTER SCHEMA secure OWNER TO meridian_etl;
+ALTER SCHEMA meta   OWNER TO meridian_etl;
 
 -- dbt owns its three schemas outright, so `dbt run` can create, drop and
 -- replace models without a superuser in the loop.
@@ -110,11 +116,8 @@ ALTER SCHEMA gold_int OWNER TO dbt_runner;
 ALTER SCHEMA gold     OWNER TO dbt_runner;
 GRANT USAGE ON SCHEMA silver TO dbt_runner;
 
-ALTER DEFAULT PRIVILEGES FOR ROLE meridian_etl IN SCHEMA silver
-    GRANT SELECT ON TABLES TO dbt_runner;
-
 -- analytics_ro: SELECT on gold, and nothing else in the warehouse except the
--- masked RAG corpus below. No secure, no oltp, no silver, no meta.
+-- masked RAG corpus and the ops metadata below. No secure, no oltp, no silver.
 GRANT USAGE ON SCHEMA gold TO analytics_ro;
 ALTER DEFAULT PRIVILEGES FOR ROLE dbt_runner IN SCHEMA gold
     GRANT SELECT ON TABLES TO analytics_ro;
@@ -139,6 +142,20 @@ GRANT USAGE ON SCHEMA silver TO rag_indexer;
 GRANT USAGE ON SCHEMA rag TO analytics_ro;
 ALTER DEFAULT PRIVILEGES FOR ROLE rag_indexer IN SCHEMA rag
     GRANT SELECT ON TABLES TO analytics_ro;
+
+-- The ops dashboard reads meta. §7 states its cache key reads
+-- meta.pipeline_run_log.completed_at, and §1 makes analytics_ro the role the
+-- dashboard connects as — so "SELECT on gold only" and "the dashboard reads
+-- pipeline_run_log" could not both be true. The same class of contradiction as
+-- the `rag` one above, resolved the same way: read-only, and meta holds no PII.
+GRANT USAGE ON SCHEMA meta TO analytics_ro;
+ALTER DEFAULT PRIVILEGES FOR ROLE meridian_etl IN SCHEMA meta
+    GRANT SELECT ON TABLES TO analytics_ro;
+
+-- dbt reads silver; the tables are created later by meridian_etl, so this is
+-- the default-privilege half and warehouse/ddl.sql carries the explicit half.
+ALTER DEFAULT PRIVILEGES FOR ROLE meridian_etl IN SCHEMA silver
+    GRANT SELECT ON TABLES TO dbt_runner;
 
 -- `secure` is the PII schema. Nobody but the ETL touches it. PUBLIC never had
 -- USAGE on a newly created schema, but stating the revoke makes the intent

@@ -6,11 +6,16 @@ CONTRACTS.md §5 makes this a module entrypoint runnable without Airflow, with
 JSON-line logs on stdout and the frozen exit codes. Airflow calls this same
 command; it never imports anything in here.
 
-Phase 1 reads seeds/rag/support_tickets.jsonl rather than silver.support_tickets
-because silver does not exist yet — that is the point of building the AI layer
-first. The `--source` flag is where the silver path lands in Phase 2, and the
-masking, chunking, hashing and upsert below are all indifferent to which one
-feeds them.
+Two sources, one pipeline. `--source silver` reads `silver.support_tickets`,
+which is the real path now that Phase 2 has built it; `--source seeds` reads
+the generated JSONL directly and needs no warehouse at all. Phase 1 shipped with
+only the second, because the whole point of building the AI layer first was that
+it could not wait for the lake — and keeping that path working means the RAG
+layer stays independently runnable rather than becoming something you can only
+demonstrate after a full pipeline run.
+
+Everything after the read is identical. Masking, chunking, hashing and the
+upsert never learn which source they were fed from.
 
 Two orderings in here are load-bearing
 --------------------------------------
@@ -134,9 +139,12 @@ def masking_fingerprint(masker: Masker) -> str:
 # ---------------------------------------------------------------------------
 
 
-def load_corpus(path: Path, since: dt.datetime | None = None) -> list[dict]:
+def load_corpus_from_seeds(path: Path, since: dt.datetime | None = None) -> list[dict]:
     if not path.is_file():
-        raise FileNotFoundError(f"ticket corpus not found at {path}. Run `make seed` first.")
+        raise FileNotFoundError(
+            f"ticket corpus not found at {path}. Run `make seed` first, or pass "
+            f"--source silver to read the warehouse instead."
+        )
     rows = []
     with path.open(encoding="utf-8") as fh:
         for line in fh:
@@ -147,6 +155,45 @@ def load_corpus(path: Path, since: dt.datetime | None = None) -> list[dict]:
             if since is not None and dt.datetime.fromisoformat(row["created_ts"]) < since:
                 continue
             rows.append(row)
+    return rows
+
+
+def load_corpus_from_silver(since: dt.datetime | None = None) -> list[dict]:
+    """Read the ticket corpus from the warehouse, as `rag_indexer`.
+
+    That role holds SELECT on this one table and nothing else in `silver`
+    (CONTRACTS.md §1), which is what makes "the AI layer cannot reach the rest of
+    the warehouse" a property of the cluster rather than of this function.
+
+    `created_ts` is normalised back to an ISO string so both sources hand the
+    rest of the module identical rows. Otherwise every downstream step would
+    have to know which source fed it, which is exactly the coupling that keeping
+    two sources is meant to avoid.
+    """
+    sql = "SELECT ticket_id, subject, body, created_ts FROM silver.support_tickets"
+    params: tuple = ()
+    if since is not None:
+        sql += " WHERE created_ts >= %s"
+        params = (since,)
+
+    with connect("rag_indexer", vectors=False) as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = [
+            {
+                "ticket_id": r[0],
+                "subject": r[1],
+                "body": r[2],
+                "created_ts": r[3].isoformat(),
+            }
+            for r in cur.fetchall()
+        ]
+
+    if not rows and since is None:
+        raise RuntimeError(
+            "silver.support_tickets is empty. Run the batch pipeline first "
+            "(`make ingest && make silver && make load-warehouse`), or pass "
+            "--source seeds to index the generated corpus directly."
+        )
     return rows
 
 
@@ -257,9 +304,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--source",
-        choices=["seeds"],
-        default="seeds",
-        help="corpus source. `silver` arrives in Phase 2, once silver.support_tickets exists.",
+        choices=["silver", "seeds"],
+        default="silver",
+        help="where to read tickets from. `silver` is the pipeline path; `seeds` "
+        "reads the generated corpus and needs no warehouse.",
     )
     p.add_argument("--limit", type=int, default=None, help="index at most N tickets")
     p.add_argument("--max-words", type=int, default=DEFAULT_MAX_WORDS)
@@ -300,8 +348,12 @@ def main(argv: list[str] | None = None) -> int:
     masker = Masker.from_project()
     fingerprint = masking_fingerprint(masker)
 
-    corpus_path = cfg.seeds_dir / "rag" / "support_tickets.jsonl"
-    tickets = load_corpus(corpus_path, args.since)
+    if args.source == "silver":
+        tickets = load_corpus_from_silver(args.since)
+    else:
+        tickets = load_corpus_from_seeds(
+            cfg.seeds_dir / "rag" / "support_tickets.jsonl", args.since
+        )
     if args.limit is not None:
         tickets = tickets[: args.limit]
 

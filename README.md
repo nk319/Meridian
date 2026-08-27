@@ -5,7 +5,7 @@ streaming ingestion, a Parquet lakehouse, a dimensional warehouse, orchestration
 data quality, governance, and a retrieval-augmented AI layer over customer
 support history.
 
-> **Build status: Phase 1 of 8 complete.** This README describes the system being
+> **Build status: Phase 2 of 8 complete.** This README describes the system being
 > built. Sections marked *planned* are not implemented yet. See
 > [`docs/PROGRESS.md`](docs/PROGRESS.md) for exactly what exists today — it is
 > updated at the end of every work session and is the resume point.
@@ -98,10 +98,16 @@ cp .env.example .env      # then set the passwords; nothing has a default
 make venv                 # .venv with the rag and dev extras
 make seed                 # generate all source data (deterministic, ~15s)
 make up                   # Postgres (pgvector) + MinIO, waits for health
+make pipeline             # source system -> Bronze -> Silver -> warehouse
 make rag-index            # chunk, mask, embed, upsert  (~3 min first run)
 make rag-eval             # measure recall@5 against the golden set
 make test                 # the full suite
 ```
+
+`make pipeline` is five steps you can also run one at a time — `bootstrap`,
+`load-oltp`, `ingest`, `silver`, `load-warehouse`. `make ingest-incremental` is
+what the second and every later run does: it reads watermarks from
+`meta.ingest_watermarks` and captures only what changed.
 
 Then ask it something:
 
@@ -122,6 +128,46 @@ demonstrated an API key, not a retrieval system.
 
 `make seed` writes ~23 MB into `seeds/`, split by source system. It is gitignored
 and fully reproducible: the same seed always produces byte-identical output.
+
+---
+
+## The batch pipeline
+
+Five source systems land in object storage as Parquet, get cleaned into Silver,
+and stream into Postgres. Airflow orchestrates it from Phase 5; until then every
+step is a module entrypoint that runs on its own, which is what makes
+`make pipeline` able to prove the platform works with the orchestrator switched
+off.
+
+**Bronze is raw and stays raw.** The file, API and vendor feeds land as text with
+no casting and no validation. They carry deliberately injected defects —
+malformed dates, invalid enums, blanked required fields — and typing on the way
+in would reject those rows at the door, where a refused row is indistinguishable
+from one that was never sent. Captured as text, every one reaches Silver and is
+quarantined *with the reason*, keeping its original bad value.
+
+**Silver is where the platform starts asserting things.** Dedup on
+`_record_hash`, then cast and validate, then keep one version per natural key.
+Rejected rows go to `quarantine/` and a row per rule lands in
+`meta.dq_check_results`; a per-entity `quarantine_rate` check runs at severity
+BLOCK, so a feed that is mostly garbage exits 2 instead of publishing a table
+that is missing most of its rows.
+
+**The hop dbt cannot make.** `dbt-postgres` cannot read Parquet from object
+storage, so "Parquet lake + dbt + Postgres" has a hole in the middle where
+Bronze and Silver never reach dbt at all. DuckDB reads the Parquet in place over
+`httpfs`, Arrow carries the batches, and binary `COPY` writes them to Postgres —
+streaming in bounded memory, needing no server extension, and failing loudly on
+a type mismatch rather than coercing. That last property was verified, not
+assumed, before anything was built on top of it.
+
+**Incremental capture is watermarked**, and the interesting case is the rows
+whose timestamp does not parse. `TRY_CAST('2026-13-45' AS TIMESTAMPTZ)` is NULL,
+so a plain `ts > watermark` silently excludes every corrupted row and the
+pipeline looks clean precisely because the bad data vanished. Admitting them with
+`OR ts IS NULL` then re-captures the same rows on every run, forever. They are
+admitted exactly once, by anti-joining the record hash against what Bronze
+already holds.
 
 ---
 
@@ -188,7 +234,23 @@ src/meridian/
   settings.py       every knob, resolved from the environment once
   db.py             connections, opened as a named contract role
   runlog.py         JSON-line run logs and the frozen exit codes
-  seed/             deterministic source-data generator
+  seed/             deterministic source-data generator, plus load_oltp
+  warehouse/
+    ddl.sql         meta, silver and secure tables; owned by the pipeline
+    bootstrap.py    applies it, idempotently
+  ingest/
+    base.py         watermarks, run log, and the one-entity-one-owner rule
+    oltp.py         Postgres source, read-only attach
+    files.py        CSV drop, captured as text because it carries defects
+    restapi.py      the platform's own API (a JSON document until Phase 6)
+    vendor.py       paginated vendor feed, follows next_cursor
+  lake/
+    layout.py       the frozen §2 paths and the six Bronze metadata columns
+    duck.py         DuckDB wired to MinIO, timezone pinned
+    bronze.py       raw capture with lineage and a positional record hash
+    silver_spec.py  what each Silver entity is allowed to contain
+    build_silver.py dedup, type, validate, quarantine
+    load_warehouse.py  Silver -> Postgres, Arrow + binary COPY
   rag/
     masking.py      dictionary-then-regex, driven by the governance YAML
     embeddings.py   fastembed, BAAI/bge-small-en-v1.5, 384 dims
@@ -221,6 +283,13 @@ A map of each concept to the file that demonstrates it lives in
 | PII masking before embedding | `src/meridian/rag/masking.py`, `tests/test_pii_manifest.py` |
 | Retrieval evaluation with a baseline | `eval/golden_questions.yml`, `rag/evaluate.py` |
 | Graceful degradation without a vendor API | `src/meridian/rag/generate.py` |
+| Medallion architecture (Bronze/Silver/Gold) | `src/meridian/lake/` |
+| Raw capture vs. typed publication | `lake/bronze.py` vs. `lake/build_silver.py` |
+| Watermarked incremental ingestion | `ingest/base.py` — `incremental_where` |
+| Cursor-paginated API ingestion | `src/meridian/ingest/vendor.py` |
+| Quarantine with a machine-readable reason | `lake/build_silver.py`, `meta.dq_check_results` |
+| Streaming load in bounded memory | `lake/load_warehouse.py` — Arrow + binary COPY |
+| PII physically excluded from the lake | `load_warehouse.load_customer_pii`, `tests/test_pii_boundary.py` |
 
 ---
 

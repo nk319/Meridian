@@ -1,4 +1,6 @@
-.PHONY: help venv seed test lint clean up down reset ps logs rag-index rag-reindex rag-eval ask search verify
+.PHONY: help venv seed test lint clean up down reset ps logs bootstrap load-oltp \
+        ingest ingest-incremental silver load-warehouse pipeline \
+        rag-index rag-reindex rag-eval ask search verify
 
 # Prefer the project venv when one exists. The RAG layer needs psycopg,
 # fastembed and pgvector; the seed generator is stdlib-only and runs anywhere.
@@ -38,6 +40,37 @@ ps:  ## Show container status (minio-init exiting 0 is success, not failure)
 logs:  ## Tail Postgres logs — where init script failures surface
 	docker compose --profile core logs -f postgres
 
+bootstrap:  ## Create the warehouse tables the pipeline owns (meta, silver, secure)
+	$(RUN) -m meridian.warehouse.bootstrap
+
+load-oltp:  ## Populate the OLTP source database from seeds/
+	$(RUN) -m meridian.seed.load_oltp
+
+ingest:  ## Full capture of all four batch sources into Bronze
+	$(RUN) -m meridian.ingest.oltp    --mode full
+	$(RUN) -m meridian.ingest.files   --mode full
+	$(RUN) -m meridian.ingest.restapi --mode full
+	$(RUN) -m meridian.ingest.vendor  --mode full
+
+ingest-incremental:  ## Watermarked capture — the second and every later run
+	$(RUN) -m meridian.ingest.oltp    --mode incremental
+	$(RUN) -m meridian.ingest.files   --mode incremental --entity web_events
+	$(RUN) -m meridian.ingest.restapi --mode incremental
+	$(RUN) -m meridian.ingest.vendor  --mode incremental
+
+silver:  ## Bronze -> Silver: dedup, type, validate, quarantine
+	$(RUN) -m meridian.lake.build_silver
+
+load-warehouse:  ## Silver Parquet -> warehouse.silver, via Arrow and COPY
+	$(RUN) -m meridian.lake.load_warehouse
+
+pipeline:  ## The whole batch chain, from source system to warehouse
+	$(MAKE) bootstrap
+	$(MAKE) load-oltp
+	$(MAKE) ingest
+	$(MAKE) silver
+	$(MAKE) load-warehouse
+
 rag-index:  ## Chunk, mask, embed and upsert the ticket corpus
 	$(RUN) -m meridian.rag.index
 
@@ -60,10 +93,11 @@ lint:  ## Lint and format check
 	$(PY) -m ruff check src tests
 	$(PY) -m ruff format --check src tests
 
-verify:  ## Everything Phase 1 claims, from a cold start
+verify:  ## Everything the README claims, from a cold start
 	$(MAKE) lint
 	$(MAKE) seed
 	$(MAKE) up
+	$(MAKE) pipeline
 	$(MAKE) rag-index
 	$(MAKE) test
 	$(MAKE) rag-eval

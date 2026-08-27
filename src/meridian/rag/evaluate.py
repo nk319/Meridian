@@ -56,6 +56,11 @@ def build_relevance(golden: dict, corpus_path: Path, masker: Masker) -> dict[str
     never from retrieval output. See the header of golden_questions.yml for why
     that distinction is the whole point of this function.
     """
+    # Ground truth comes from the generated corpus, not from silver, and
+    # deliberately so: `intent` is the label the generator assigned before any
+    # of this existed. Reading it back out of the warehouse would work equally
+    # well today and would quietly become circular the moment Phase 4's AI
+    # enrichment starts writing a predicted intent into the same column.
     corpus = []
     with corpus_path.open(encoding="utf-8") as fh:
         for line in fh:
