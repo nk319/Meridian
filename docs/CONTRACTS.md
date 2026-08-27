@@ -54,12 +54,18 @@ Bronze is **not** a Postgres schema. Bronze lives only in object storage as Parq
 | `meridian_app`    | CRUD on `oltp.*`. No warehouse access.                       |
 | `meridian_etl`    | Read `oltp.*`; write `silver.*`, `secure.*`, `meta.*`.       |
 | `dbt_runner`      | Owns `gold_stg`, `gold_int`, `gold`. Reads `silver`.         |
-| `analytics_ro`    | **SELECT on `gold` only.** No `secure`, no `oltp`, no `silver`. |
+| `analytics_ro`    | **SELECT on `gold` and on `rag`.** No `secure`, no `oltp`, no `silver`. |
 | `rag_indexer`     | Read `silver.support_*`; write `rag.*`. **No `secure` grant.** |
 
 `analytics_ro` is what the Streamlit dashboard and every `/v1/ai/*` handler connect
 as. `tests/test_pii_boundary.py` asserts `InsufficientPrivilege` when that role
 selects a PII column. That test is the governance requirement's only actual proof.
+
+The `rag` grant was added in Phase 1 and is a correction, not a widening: this
+document already made `analytics_ro` the role the AI handlers connect as, and
+those handlers read `rag.chunks`, so "SELECT on `gold` only" and "the role every
+`/v1/ai/*` handler uses" could never both be true. `rag` holds masked text by
+construction (§11). The `secure` grant is unchanged — still none.
 
 `ALTER DEFAULT PRIVILEGES` is set so dbt-created tables are readable by
 `analytics_ro` automatically, plus a belt-and-braces post-dbt `GRANT` task —
@@ -387,8 +393,82 @@ manifest. This is what makes AI-first sequencing safe rather than merely conveni
 
 ---
 
+## 11. The RAG store
+
+Added in Phase 1. `rag.chunks` is a cross-component interface — the indexer
+writes it, retrieval and every `/v1/ai/*` handler read it — so it belongs here
+rather than in the module that happens to create it.
+
+### Ownership
+
+The `rag` schema is owned by `rag_indexer`, and its tables are created by
+`python -m meridian.rag.index` from `src/meridian/rag/ddl.sql`, not by
+`db/init/`. §1 freezes the init sequence at 01..05 and names `rag` as "written
+by the rag indexer"; adding a `06_rag_ddl.sql` would contradict both. The
+practical effect is that a fresh clone needs no migration step.
+
+### The schema invariant
+
+**`rag` holds masked text and nothing else.** That is a property of the schema,
+not of particular tables, which is what makes it safe to grant `analytics_ro`
+SELECT across it rather than on a hand-picked list that would drift.
+`tests/test_pii_manifest.py` is what keeps the invariant true.
+
+| Table | Grain | Notes |
+| ----- | ----- | ----- |
+| `rag.chunks` | one row per chunk of one ticket | masked `content`, `vector(384)` embedding, `content_hash`, `masking_fingerprint`, `embedding_model`, `doc_len` |
+| `rag.chunk_terms` | one row per (chunk, lexeme) | the inverted index BM25 scores from; `tf` per term |
+| `rag.index_runs` | one row per indexer run | chunks embedded/skipped/deleted, PII counts split by pass |
+| `rag.eval_results` | one row per (eval run, strategy, question) | retrieval quality over time |
+
+### Two properties that are load-bearing
+
+**`content_hash` is taken over the masked text, never the raw.** The hash is the
+indexer's skip key. Hashing raw input means a later masking fix leaves
+already-indexed chunks with an unchanged hash, so they are skipped on every
+subsequent run and the leaked text stays in the store permanently — the exact
+failure §10 describes. Hashing the output makes "masking changed this chunk" and
+"re-embed this chunk" the same event. The skip predicate is
+`(content_hash, masking_fingerprint, embedding_model)`, so a change to the
+policy, the manifest or the model re-embeds the corpus rather than leaving a mix
+of vintages behind.
+
+**`content_tsv` is generated from redaction-stripped text.** `[CUSTOMER_NAME]`
+analyses to the lexemes `custom` and `name`, which would then appear in every
+chunk that contained a person's name — 394 of 1,311 in the default seed, 30% of
+the corpus. BM25 would treat them as ordinary terms with ordinary IDF, so a
+question mentioning "customer" would score against redaction artefacts, matching
+precisely the documents whose text had been removed. The placeholders stay in
+`content`, where they inform a human reader and the model; they are not evidence
+about topic.
+
+### Retrieval
+
+Hybrid: BM25 over `rag.chunk_terms` and cosine similarity over the HNSW index,
+fused with Reciprocal Rank Fusion (`k=60`) in a single SQL statement.
+
+BM25 is implemented in SQL rather than taken from an extension. Postgres's
+built-in `ts_rank_cd` weights term frequency and proximity but has **no inverse
+document frequency**, so on a corpus where 70% of tickets contain the word
+"order" it cannot distinguish that from an order number appearing in one. IDF is
+most of what makes lexical retrieval work here. Materialising `(chunk_id,
+lexeme, tf)` makes real BM25 a plain aggregation — `df` is a COUNT, `dl` is a
+SUM — at about 20,000 rows for this corpus, which is a smaller dependency than
+pulling in `pg_search`.
+
+Abstention thresholds on cosine similarity, not on the RRF score: `1/(k+1)` is
+the same number whether the top hit is a paraphrase of the question or an
+unrelated ticket, because rank carries no notion of closeness.
+
+---
+
 ## Deviations from the plan
 
 | Plan said        | Built as   | Why                                                    |
 | ---------------- | ---------- | ------------------------------------------------------ |
 | `ecom_platform`  | `meridian` | Same non-shadowing property, matches the repo name.    |
+| §1: `analytics_ro` has "SELECT on `gold` only" | `gold` **and** `rag` | §1 also makes `analytics_ro` the role every `/v1/ai/*` handler connects as, and those handlers must read `rag.chunks`. Both could not hold. Safe because `rag` holds masked text by construction (§11) and `tests/test_pii_manifest.py` enforces it. The grant on `secure` is unchanged: still none. |
+| §9 freezes one vocabulary named `channel` | two, sharing the name | `orders.channel` is the marketing channel (`organic`, `paid_search`, …); `support_tickets.channel` is the contact channel (`email`, `chat`, `phone`, `web_form`). Both are real and neither should borrow the other's name. Recorded so the first person to write a union across them finds this instead of the bug. |
+| §9 has no `ticket_status` | `open`, `pending`, `resolved` | The source system has ticket lifecycle state and §9 never gave it a vocabulary. Enforced as a CHECK constraint in `db/init/05_oltp_ddl.sql`; promote to §9 when Phase 4 builds `fact_support_tickets`. |
+| §1: `rag_indexer` reads `silver.support_*` | schema USAGE only, so far | `silver.support_tickets` does not exist until Phase 2. Granting SELECT on all of `silver` now would be broader than the contract; the table-level grant is issued when the table is created. Phase 1 indexes from `seeds/` and needs no `silver` read at all. |
+| §7: one pipeline run log | plus `rag.index_runs` | Not a second run log. `meta.pipeline_run_log` has nowhere to record chunks skipped by content hash or PII hits split by masking pass, which are the numbers that say whether the indexer is working. `rag_indexer` is still granted nothing on `meta`. |

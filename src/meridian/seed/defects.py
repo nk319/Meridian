@@ -61,15 +61,29 @@ def inject(
             col = rng.choice(required_columns)
             original = row.get(col)
             row[col] = ""
-            manifest.append({"entity": entity, "row_index": idx, "column": col,
-                             "defect": "null_required", "original": original})
+            manifest.append(
+                {
+                    "entity": entity,
+                    "row_index": idx,
+                    "column": col,
+                    "defect": "null_required",
+                    "original": original,
+                }
+            )
 
         elif kind == "invalid_enum":
             col = rng.choice(list(enum_columns))
             original = row.get(col)
             row[col] = rng.choice(["UNKNOWN", "n/a", "PENDING_REVIEW", ""])
-            manifest.append({"entity": entity, "row_index": idx, "column": col,
-                             "defect": "invalid_enum", "original": original})
+            manifest.append(
+                {
+                    "entity": entity,
+                    "row_index": idx,
+                    "column": col,
+                    "defect": "invalid_enum",
+                    "original": original,
+                }
+            )
 
         elif kind == "negative_amount":
             col = rng.choice(numeric_columns)
@@ -78,15 +92,29 @@ def inject(
                 row[col] = -abs(float(original))
             except (TypeError, ValueError):
                 row[col] = -1.0
-            manifest.append({"entity": entity, "row_index": idx, "column": col,
-                             "defect": "negative_amount", "original": original})
+            manifest.append(
+                {
+                    "entity": entity,
+                    "row_index": idx,
+                    "column": col,
+                    "defect": "negative_amount",
+                    "original": original,
+                }
+            )
 
         elif kind == "malformed_date":
             col = rng.choice(date_columns)
             original = row.get(col)
             row[col] = rng.choice(["2026-13-45", "not-a-date", "31/02/2026", ""])
-            manifest.append({"entity": entity, "row_index": idx, "column": col,
-                             "defect": "malformed_date", "original": original})
+            manifest.append(
+                {
+                    "entity": entity,
+                    "row_index": idx,
+                    "column": col,
+                    "defect": "malformed_date",
+                    "original": original,
+                }
+            )
 
     # Duplicates: a separate mechanism, since they are a property of the row set
     # rather than of any single field. This is what the dedup logic in the
@@ -95,7 +123,14 @@ def inject(
     for _ in range(n_dupes):
         src = rng.randrange(len(rows))
         rows.append(copy.deepcopy(rows[src]))
-        manifest.append({"entity": entity, "row_index": src, "column": None,
-                         "defect": "duplicate_row", "original": None})
+        manifest.append(
+            {
+                "entity": entity,
+                "row_index": src,
+                "column": None,
+                "defect": "duplicate_row",
+                "original": None,
+            }
+        )
 
     return rows, manifest

@@ -1,0 +1,182 @@
+# Golden retrieval set.
+#
+# Sixteen questions: eleven the ticket corpus can answer, five it cannot.
+#
+# How relevance is decided, and why it is not circular
+# ----------------------------------------------------
+# The obvious way to build this file is to run retrieval, look at what comes
+# back, and record those ticket IDs as the ground truth. That measures nothing:
+# the answer key is the system's own output, so recall is 1.0 by construction and
+# stays 1.0 through any regression that changes results consistently.
+#
+# So relevance is defined against properties the seed generator assigned before
+# any retrieval existed. Every ticket carries a ground-truth `intent` chosen by
+# the generator, and the intent grammar guarantees which phrases appear in which
+# template. A retrieved chunk counts as relevant when its ticket's intent matches
+# `relevant.intent` AND its text contains every string in
+# `relevant.content_contains`. Neither condition is anything retrieval produced.
+# `intents` (a list) is available where a question is genuinely answered by more
+# than one intent; `intent` is shorthand for a single-entry list.
+#
+# The `content_contains` clause is what keeps the bar meaningful. Intent alone is
+# too easy: 26% of the corpus is shipping_delay, so five random chunks hit that
+# intent about 78% of the time and a broken retriever would still score well.
+# Requiring a specific phrase narrows each question's relevant set to tens of
+# tickets out of 1,311.
+#
+# What the abstention cases do and do not prove
+# ---------------------------------------------
+# The five `expects_answer: false` questions are off-domain: the corpus contains
+# support tickets, and no amount of retrieval will find Meridian's share price in
+# them. Similarity-threshold abstention is the right mechanism for exactly this
+# case and is measured here.
+#
+# It is NOT a mechanism for on-topic-but-unanswerable questions. "What is the
+# average delivery time in days?" retrieves genuinely relevant delivery
+# complaints with high similarity, and no threshold on similarity can catch it —
+# the passages really are about delivery, they just do not contain an average.
+# That case is handled in the system prompt in generate.py, which instructs the
+# model to say when the excerpts do not answer the question, and it is not what
+# this file measures. Claiming otherwise would make the abstention number mean
+# more than it does.
+
+version: 1
+recall_at_k: 5
+
+questions:
+  # -------------------------------------------------------------------------
+  # Answerable
+  # -------------------------------------------------------------------------
+  - id: duplicate_charge
+    question: I was billed twice for the same order — can you refund one of the charges?
+    expects_answer: true
+    # Two intents, because the question genuinely spans both and labelling it
+    # with one made a correct answer score as a miss. The corpus contains
+    # "Getting billed twice for what looks like the same order" (billing_question)
+    # and "Order X was a duplicate — I was charged twice for the same thing.
+    # Please refund one of them" (refund_request). The second answers a question
+    # that says "refund" at least as well as the first; scoring it wrong was a
+    # defect in this file, found by reading what retrieval actually returned
+    # before believing the number it produced.
+    relevant:
+      intents: [billing_question, refund_request]
+      content_contains: ["twice"]
+
+  - id: refund_not_as_described
+    question: customer wants a refund because the item did not match the listing photos
+    expects_answer: true
+    relevant:
+      intent: refund_request
+      content_contains: ["misleading"]
+
+  - id: tracking_stalled
+    question: orders where the tracking has not updated in over a week
+    expects_answer: true
+    relevant:
+      intent: shipping_delay
+      content_contains: ["tracking"]
+
+  - id: carrier_label_created
+    question: carrier page still says label created and nothing has shipped
+    expects_answer: true
+    # A rare exact phrase rather than a paraphrase. Embeddings compress away
+    # low-frequency literals, so this question is the one the lexical half of
+    # hybrid retrieval is supposed to carry — and the per-strategy breakdown in
+    # `make rag-eval` is where you can see whether it does.
+    relevant:
+      intent: shipping_delay
+      content_contains: ["label created"]
+
+  - id: cracked_casing
+    question: item arrived with a cracked casing but the packaging was intact
+    expects_answer: true
+    relevant:
+      intent: product_defect
+      content_contains: ["cracked casing"]
+
+  - id: intermittent_power
+    question: device powers on but shuts off after about ten minutes
+    expects_answer: true
+    relevant:
+      intent: product_defect
+      content_contains: ["cuts out"]
+
+  - id: password_reset_missing
+    question: password reset email never arrives even after checking spam
+    expects_answer: true
+    relevant:
+      intent: account_access
+      content_contains: ["password reset"]
+
+  - id: return_label_missing
+    question: started a return but the shipping label was never sent
+    expects_answer: true
+    relevant:
+      intent: return_process
+      content_contains: ["label"]
+
+  - id: discount_code_not_applied
+    question: the discount code was not taken off the order total
+    expects_answer: true
+    relevant:
+      intent: billing_question
+      content_contains: ["discount code"]
+
+  - id: bulk_discount
+    question: is there a discount for ordering more than five units
+    expects_answer: true
+    relevant:
+      intent: general_inquiry
+      content_contains: ["bulk discount"]
+
+  - id: order_reference_lookup
+    question: What is the problem reported on order O0000019?
+    expects_answer: true
+    # The one question on this set that discriminates between the two rankers,
+    # and the reason it is here.
+    #
+    # Every other question paraphrases a template, and the intent grammar emits
+    # each template dozens of times, so all three strategies return five
+    # relevant tickets and recall and precision both sit at 1.00. A metric
+    # pinned at its ceiling cannot detect a regression.
+    #
+    # This one names an identifier that occurs in exactly one of the 1,311
+    # tickets, wrapped in ordinary words. The wrapping is the point: vector
+    # search handles the bare token "O0000019" perfectly, and only loses it when
+    # the embedding is diluted by problem/reported/order. BM25 gives a token
+    # appearing in one document a very high IDF regardless of phrasing and finds
+    # it at rank 1. It is the case hybrid retrieval exists for, so the eval
+    # should contain it rather than assert it.
+    #
+    # Bound to the pinned generator seed (config.DEFAULT_SEED), as the Phase 0
+    # row-count assertions already are. Regenerating with different volumes
+    # makes build_relevance fail with a message naming this question, rather
+    # than silently scoring zero and reading as a retrieval regression.
+    relevant:
+      content_contains: ["O0000019"]
+
+  # -------------------------------------------------------------------------
+  # Must abstain — off-domain for a support-ticket corpus
+  # -------------------------------------------------------------------------
+  - id: ceo_salary
+    question: What is the chief executive's annual salary?
+    expects_answer: false
+
+  - id: distribution_centres
+    question: How many distribution centres does the company operate in Europe?
+    expects_answer: false
+
+  - id: share_price
+    question: What was the company share price at the end of last quarter?
+    expects_answer: false
+
+  - id: python_version
+    question: Which version of Python does the data platform run on?
+    expects_answer: false
+    # Deliberately the hardest of the five. It shares vocabulary with the
+    # platform's own documentation and reads like a plausible internal question,
+    # so it is the one most likely to score just above the threshold.
+
+  - id: acquire_competitor
+    question: Should we acquire our largest competitor next year?
+    expects_answer: false

@@ -4,12 +4,41 @@ version = "0.1.0"
 description = "An e-commerce analytics platform demonstrating the data engineering stack end to end"
 requires-python = ">=3.11"
 
+# Runtime dependencies of the pipeline itself. Deliberately small: the seed
+# generator is stdlib-only, and `pip install -e .` must not drag in the AI or
+# web stacks for someone who only wants to generate source data.
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "pgvector>=0.3",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# The Phase 1 AI layer. `anthropic` is here rather than in `rag` core because
+# retrieval works without it — CONTRACTS.md keeps the platform functional with
+# no ANTHROPIC_API_KEY set, answering extractively from retrieved passages.
+rag = [
+    "fastembed>=0.4",
+    "anthropic>=0.40",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# ddl.sql ships inside the package because the indexer owns the rag schema and
+# applies it at startup (CONTRACTS.md §11). Without this it survives an editable
+# install and vanishes from a wheel, which fails at the first `make rag-index`
+# on a real deployment and nowhere earlier.
+[tool.setuptools.package-data]
+"meridian.rag" = ["*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -20,6 +49,18 @@ addopts = "-q"
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
+
+[tool.ruff.format]
+# ruff format expands any collection carrying a magic trailing comma to one item
+# per line. In these two modules that would turn deliberately hand-aligned data
+# tables — 48 first names laid out 8 to a row, the 12-month seasonality curve
+# written as two readable rows — into ~160 lines of one-per-line noise. They are
+# data, formatted to be read as data, and the formatter has no way to know that.
+# Everything else in the tree is formatted.
+exclude = [
+    "src/meridian/seed/config.py",
+    "src/meridian/seed/identity.py",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

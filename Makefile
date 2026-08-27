@@ -1,17 +1,72 @@
-.PHONY: help seed test lint clean
+.PHONY: help venv seed test lint clean up down reset ps logs rag-index rag-reindex rag-eval ask search verify
+
+# Prefer the project venv when one exists. The RAG layer needs psycopg,
+# fastembed and pgvector; the seed generator is stdlib-only and runs anywhere.
+PY := $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)
+RUN := PYTHONPATH=src $(PY)
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-seed:  ## Generate all source data into seeds/
-	PYTHONPATH=src python3 -m meridian.seed --out seeds/
+venv:  ## Create .venv and install the project with its rag and dev extras
+	python3 -m venv .venv
+	.venv/bin/python -m pip install --upgrade pip
+	.venv/bin/python -m pip install -e ".[rag,dev]"
 
-test:  ## Run the test suite
-	python3 -m pytest
+seed:  ## Generate all source data into seeds/
+	$(RUN) -m meridian.seed --out seeds/
+
+up:  ## Start the core profile (Postgres + MinIO) and wait for health
+	@test -f .env || { echo "no .env — copy .env.example and fill it in"; exit 1; }
+	docker compose --profile core up -d
+# --wait is scoped to the two long-running services deliberately. minio-init is
+# a one-shot that creates the lake bucket and exits 0, and `--wait` treats a
+# zero-exit container as a failure — waiting on the whole profile therefore
+# fails on a perfectly healthy stack.
+	docker compose --profile core up -d --wait postgres minio
+	@echo "core profile ready: postgres healthy, pgvector present, lake bucket created"
+
+down:  ## Stop the stack, keeping volumes
+	docker compose --profile core down
+
+reset:  ## Stop and DESTROY volumes, so db/init/*.sql run again on next `make up`
+	docker compose --profile core down -v
+
+ps:  ## Show container status (minio-init exiting 0 is success, not failure)
+	docker compose --profile core ps -a
+
+logs:  ## Tail Postgres logs — where init script failures surface
+	docker compose --profile core logs -f postgres
+
+rag-index:  ## Chunk, mask, embed and upsert the ticket corpus
+	$(RUN) -m meridian.rag.index
+
+rag-reindex:  ## Same, but discard the store first and rebuild from scratch
+	$(RUN) -m meridian.rag.index --rebuild
+
+rag-eval:  ## Measure recall@5 for hybrid, vector-only and lexical-only
+	$(RUN) -m meridian.rag.evaluate --min-recall 0.80
+
+search:  ## Hybrid search. Usage: make search Q="tracking has not updated"
+	@$(RUN) -m meridian.rag.retrieve "$(Q)"
+
+ask:  ## Answer a question. Usage: make ask Q="why do customers ask for refunds?"
+	@$(RUN) -m meridian.rag.generate "$(Q)"
+
+test:  ## Run the test suite. DB-backed tests skip when the stack is down.
+	$(PY) -m pytest
 
 lint:  ## Lint and format check
-	ruff check src tests
-	ruff format --check src tests
+	$(PY) -m ruff check src tests
+	$(PY) -m ruff format --check src tests
+
+verify:  ## Everything Phase 1 claims, from a cold start
+	$(MAKE) lint
+	$(MAKE) seed
+	$(MAKE) up
+	$(MAKE) rag-index
+	$(MAKE) test
+	$(MAKE) rag-eval
 
 clean:  ## Remove generated data
 	rm -rf seeds/ .pytest_cache/ .ruff_cache/

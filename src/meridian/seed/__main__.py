@@ -87,9 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     customer_pii = [
         {"customer_id": c["customer_id"], **{k: c[k] for k in pii_columns}} for c in customers
     ]
-    customers_safe = [
-        {k: v for k, v in c.items() if k not in pii_columns} for c in customers
-    ]
+    customers_safe = [{k: v for k, v in c.items() if k not in pii_columns} for c in customers]
 
     # --- inject defects into third-party feeds only -----------------------
     defect_manifest: list[dict] = []

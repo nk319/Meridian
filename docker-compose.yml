@@ -1,0 +1,126 @@
+# Meridian local stack.
+#
+# Profiles keep the footprint honest. `core` is everything Phase 1 needs and
+# nothing else — Postgres and MinIO, about 700 MB resident. Later phases add
+# `full` (Redpanda, Airflow, the API, the dashboard), which peaks around 6.5 GB.
+# Running one profile must never require standing up the other.
+#
+#   docker compose --profile core up -d
+#
+# Every value comes from .env (copy .env.example). Nothing here carries a
+# default credential: an unset password fails the init scripts loudly rather
+# than silently creating a role with a blank password.
+
+name: meridian
+
+services:
+  # --------------------------------------------------------------------------
+  # Postgres. pgvector/pgvector:pg16, NOT postgres:16-alpine.
+  #
+  # CONTRACTS.md §1: the alpine image has no pgvector, and the failure surfaces
+  # much later as a confusing "type vector does not exist" from the indexer
+  # rather than at startup. The healthcheck below asserts the extension is
+  # actually present, so a wrong image fails here instead of in Phase 1 code.
+  # --------------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    profiles: [core, full]
+    container_name: meridian-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:?set POSTGRES_SUPERUSER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in .env}
+      POSTGRES_DB: postgres
+      # Read by db/init/04_roles.sql through psql's \getenv, so role passwords
+      # are never written into a file in this repo.
+      MERIDIAN_APP_PASSWORD: ${MERIDIAN_APP_PASSWORD:?set MERIDIAN_APP_PASSWORD in .env}
+      MERIDIAN_ETL_PASSWORD: ${MERIDIAN_ETL_PASSWORD:?set MERIDIAN_ETL_PASSWORD in .env}
+      DBT_RUNNER_PASSWORD: ${DBT_RUNNER_PASSWORD:?set DBT_RUNNER_PASSWORD in .env}
+      ANALYTICS_RO_PASSWORD: ${ANALYTICS_RO_PASSWORD:?set ANALYTICS_RO_PASSWORD in .env}
+      RAG_INDEXER_PASSWORD: ${RAG_INDEXER_PASSWORD:?set RAG_INDEXER_PASSWORD in .env}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # Postgres runs these once, in filename order, on an empty data directory.
+      # It aborts the whole startup on any error, which is why the ordering in
+      # CONTRACTS.md §1 is create-before-grant rather than a convention.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # Three assertions, and each one is load-bearing.
+      #
+      # pg_isready alone goes green as soon as the socket accepts connections.
+      # During initdb the entrypoint runs a temporary server on the unix socket,
+      # so a socket-only check reports healthy while 03..05 are still running —
+      # and anything with `depends_on: service_healthy` then starts against a
+      # half-built database. Asserting the LAST object the init sequence creates
+      # (oltp.support_tickets, from 05) closes that window.
+      #
+      # pg_extension proves this image really is pgvector/pgvector:pg16 rather
+      # than a plain postgres that would break the RAG layer much later.
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U "$${POSTGRES_USER}" -d warehouse -q &&
+          psql -U "$${POSTGRES_USER}" -d warehouse -tAc
+          "select 1 from pg_extension where extname = 'vector'" | grep -q 1 &&
+          psql -U "$${POSTGRES_USER}" -d oltp -tAc
+          "select 1 where to_regclass('public.support_tickets') is not null" | grep -q 1
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 20s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # MinIO — the object store standing in for S3. Phase 1 does not read from it;
+  # it is here because the bucket layout in CONTRACTS.md §2 is a frozen
+  # interface and Phase 2 should find it already correct.
+  # --------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    profiles: [core, full]
+    container_name: meridian-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # One-shot: create the lake bucket. Exits 0 and stays exited — `docker compose
+  # ps` showing it as Exited(0) is success, not a failure.
+  # --------------------------------------------------------------------------
+  minio-init:
+    image: minio/mc:latest
+    profiles: [core, full]
+    container_name: meridian-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      LAKE_BUCKET: ${LAKE_BUCKET:-meridian-lake}
+    entrypoint: >-
+      /bin/sh -c "
+      mc alias set local http://minio:9000 \"$${MINIO_ROOT_USER}\" \"$${MINIO_ROOT_PASSWORD}\" &&
+      mc mb --ignore-existing \"local/$${LAKE_BUCKET}\" &&
+      mc ls local &&
+      echo 'lake bucket ready'
+      "
+    restart: "no"
+
+volumes:
+  postgres-data:
+  minio-data:

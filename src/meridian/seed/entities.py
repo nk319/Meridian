@@ -30,6 +30,7 @@ def _round2(x: float) -> float:
 # products
 # --------------------------------------------------------------------------
 
+
 def make_products(rng: random.Random, n: int) -> list[dict]:
     products = []
     pid = 0
@@ -56,8 +57,8 @@ def make_products(rng: random.Random, n: int) -> list[dict]:
                 "product_id": f"P{pid:05d}",
                 "sku": f"{category[:3].upper()}-{subcategory[:3].upper()}-{pid:05d}",
                 "product_name": f"{subcategory[:-1] if subcategory.endswith('s') else subcategory} "
-                                f"{rng.choice(['Pro', 'Lite', 'Studio', 'Classic', 'Max', 'Mini'])} "
-                                f"{rng.randint(1, 9)}",
+                f"{rng.choice(['Pro', 'Lite', 'Studio', 'Classic', 'Max', 'Mini'])} "
+                f"{rng.randint(1, 9)}",
                 "category": category,
                 "subcategory": subcategory,
                 "unit_price": price,
@@ -72,6 +73,7 @@ def make_products(rng: random.Random, n: int) -> list[dict]:
 # --------------------------------------------------------------------------
 # customers
 # --------------------------------------------------------------------------
+
 
 def enrich_customers(
     rng: random.Random,
@@ -149,6 +151,7 @@ def enrich_customers(
 # --------------------------------------------------------------------------
 # orders, items, payments
 # --------------------------------------------------------------------------
+
 
 def make_orders(
     rng: random.Random,
@@ -276,7 +279,12 @@ def make_orders(
                         "processed_ts": ts,
                         "failure_reason": (
                             rng.choice(
-                                ["insufficient_funds", "do_not_honor", "expired_card", "network_timeout"]
+                                [
+                                    "insufficient_funds",
+                                    "do_not_honor",
+                                    "expired_card",
+                                    "network_timeout",
+                                ]
                             )
                             if pstatus == "failed"
                             else ""
@@ -293,6 +301,7 @@ def make_orders(
 # --------------------------------------------------------------------------
 # web events
 # --------------------------------------------------------------------------
+
 
 def make_web_events(
     rng: random.Random,
@@ -346,9 +355,10 @@ def make_web_events(
             continue
         when = signup + dt.timedelta(days=rng.randint(0, span))
         base_ts = dt.datetime.combine(when, dt.time(rng.randint(6, 23), rng.randint(0, 59)))
-        session_id = "S" + hashlib.sha1(
-            f"{cust['customer_id']}{when}{rng.random()}".encode()
-        ).hexdigest()[:14]
+        session_id = (
+            "S"
+            + hashlib.sha1(f"{cust['customer_id']}{when}{rng.random()}".encode()).hexdigest()[:14]
+        )
 
         depth = rng.choices([1, 2, 3, 4], weights=[0.42, 0.30, 0.19, 0.09], k=1)[0]
         steps = ["page_view", "product_view", "add_to_cart", "begin_checkout"][:depth]
