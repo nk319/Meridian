@@ -2,7 +2,9 @@
         ingest ingest-incremental silver load-warehouse pipeline dq \
         airflow-build airflow-up airflow-down airflow-logs airflow-test \
         rag-index rag-reindex rag-eval rag-enrich ask search verify \
-        dbt-venv dbt-run dbt-test dbt-snapshot dbt-snapshot-backfill dbt-results dbt-docs gold
+        dbt-venv dbt-run dbt-test dbt-snapshot dbt-snapshot-backfill dbt-results dbt-docs gold \
+        stream-up stream-down stream-topics stream-produce stream-consume stream-lag \
+        stream-dlq stream-demo
 
 # Prefer the project venv when one exists. The RAG layer needs psycopg,
 # fastembed and pgvector; the seed generator is stdlib-only and runs anywhere.
@@ -101,6 +103,45 @@ airflow-logs:  ## Tail the scheduler
 airflow-test:  ## Parse the DAGs and report import errors
 	docker compose --profile full run --rm airflow-init bash -c \
 	  "airflow dags list && airflow dags list-import-errors"
+
+# --------------------------------------------------------------------------
+# Streaming. CONTRACTS.md §4.
+# --------------------------------------------------------------------------
+stream-up:  ## Start Redpanda + Console and create the declared topics
+	docker compose --profile stream up -d --wait redpanda
+	docker compose --profile stream up -d redpanda-console
+	$(RUN) -m meridian.stream.admin --create
+	@echo "broker ready on localhost:19092; console on http://localhost:8090"
+
+stream-down:  ## Stop the broker, keeping its data
+	docker compose --profile stream down
+
+stream-topics:  ## Show broker state against contracts/topics.yml
+	$(RUN) -m meridian.stream.admin --describe
+
+stream-produce:  ## Replay seed events onto the topic. N=5000 DEFECTS=0.02
+	$(RUN) -m meridian.stream.produce --count $(or $(N),5000) --defects $(or $(DEFECTS),0.02)
+
+stream-consume:  ## Run both consumer groups to completion
+	$(RUN) -m meridian.stream.sink_bronze --idle-timeout 8
+	$(RUN) -m meridian.stream.metrics --window 3600 --idle-timeout 8
+
+stream-lag:  ## Record consumer lag into meta.kafka_consumer_offsets, and show it
+	$(RUN) -m meridian.stream.lag
+
+stream-dlq:  ## Read the dead letter queue
+	$(RUN) -m meridian.stream.dlq --show-payload
+
+stream-demo:  ## Produce, consume with both groups, then show lag and the DLQ
+	$(MAKE) stream-topics
+	$(MAKE) stream-produce N=3000 DEFECTS=0.02
+	@echo "\n--- lag with nothing consumed yet ---"
+	$(RUN) -m meridian.stream.lag --no-persist
+	$(MAKE) stream-consume
+	@echo "\n--- lag after both groups drained ---"
+	$(MAKE) stream-lag
+	@echo "\n--- what could not be processed ---"
+	$(MAKE) stream-dlq
 
 # --------------------------------------------------------------------------
 # dbt. A separate interpreter from .venv, mirroring the production split — see

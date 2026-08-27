@@ -1,0 +1,19 @@
+{
+  "type": "record",
+  "name": "DlqEnvelope",
+  "namespace": "com.meridian.ecom",
+  "doc": "A message that could not be processed, wrapped with enough context to reprocess it. The raw bytes are kept verbatim: a DLQ that stores a parsed representation cannot hold the messages that failed because they would not parse.",
+  "fields": [
+    {"name": "failed_at",       "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    {"name": "consumer_group",  "type": "string", "doc": "Who could not handle it. Two groups read the same topic and fail differently."},
+    {"name": "source_topic",    "type": "string"},
+    {"name": "source_partition","type": "int"},
+    {"name": "source_offset",   "type": "long",
+     "doc": "With the two above, this is the coordinate that lets a human go and read the original message on the source topic. A DLQ entry you cannot trace back is a log line."},
+    {"name": "error_type",      "type": "string"},
+    {"name": "error_detail",    "type": "string"},
+    {"name": "key",             "type": ["null", "bytes"], "default": null},
+    {"name": "payload",         "type": ["null", "bytes"], "default": null,
+     "doc": "The original value, unparsed and untouched."}
+  ]
+}

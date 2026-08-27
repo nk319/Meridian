@@ -71,6 +71,43 @@ CREATE TABLE IF NOT EXISTS meta.ingest_watermarks (
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
 
+-- --------------------------------------------------------------------------
+-- Windowed metrics computed on the streaming path, by the `realtime-metrics`
+-- consumer group.
+--
+-- Separate from the gold marts, and deliberately so. These are what the stream
+-- believed at a point in time, computed from an at-least-once feed with no
+-- late-arrival handling; the marts are what the batch path concluded after
+-- deduplication and quality gating. They will disagree, and the disagreement
+-- is the honest part — a dashboard that shows both is showing the actual
+-- tradeoff between latency and correctness rather than asserting there isn't
+-- one.
+--
+-- The grain is one metric per (window, topic, metric, dimension). Windows are
+-- closed by the consumer as it crosses a boundary, so the most recent window is
+-- always partial and `is_closed` says which.
+-- --------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS meta.stream_metrics (
+    window_start    timestamptz NOT NULL,
+    window_seconds  int         NOT NULL CHECK (window_seconds > 0),
+    topic           text        NOT NULL,
+    consumer_group  text        NOT NULL,
+    metric          text        NOT NULL,
+    -- The dimension value this metric is sliced by — an event_type, a channel.
+    -- A single column rather than one per dimension: the set of slices changes
+    -- with the questions being asked, and a schema migration per question is
+    -- how a metrics table stops being used.
+    dimension       text        NOT NULL DEFAULT '_total',
+    value           numeric     NOT NULL,
+    is_closed       boolean     NOT NULL DEFAULT false,
+    observed_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (window_start, topic, metric, dimension)
+);
+
+CREATE INDEX IF NOT EXISTS stream_metrics_window_idx
+    ON meta.stream_metrics (window_start DESC);
+
+
 CREATE TABLE IF NOT EXISTS meta.kafka_consumer_offsets (
     consumer_group text        NOT NULL,
     topic          text        NOT NULL,

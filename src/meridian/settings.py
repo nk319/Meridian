@@ -102,6 +102,11 @@ class Settings:
     minio_secret_key: str
     lake_bucket: str
 
+    # The host-facing broker address by default (`localhost:19092`). Compose
+    # overrides it to `redpanda:9092` for services inside the network, exactly
+    # as it does for POSTGRES_HOST — the broker advertises both listeners.
+    kafka_bootstrap_servers: str
+
     embedding_model: str
     anthropic_model: str
     anthropic_api_key: str
@@ -171,6 +176,7 @@ def settings() -> Settings:
         embedding_model=os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
         anthropic_model=os.environ.get("ANTHROPIC_MODEL", "claude-opus-5"),
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+        kafka_bootstrap_servers=os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:19092"),
         rrf_k=_int("RAG_RRF_K", 60),
         candidate_pool=_int("RAG_CANDIDATE_POOL", 50),
         top_k=_int("RAG_TOP_K", 5),

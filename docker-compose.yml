@@ -123,6 +123,80 @@ services:
     restart: "no"
 
   # --------------------------------------------------------------------------
+  # Redpanda — Kafka wire protocol, single node. CONTRACTS.md §4.
+  #
+  # The flags are not optional and the first one is not cosmetic. Redpanda is
+  # built on Seastar, which by default assumes it owns the machine and
+  # busy-polls its reactor — on a laptop or a CI box that pins a full core at
+  # 100% forever, with an idle broker. `--overprovisioned` switches it to a
+  # polite polling mode. `--smp 1` and the memory flags keep it to one core and
+  # 1 GB rather than reserving most of the host.
+  #
+  # `--check=false` skips the production readiness checks (fs type, clock
+  # source, aio limits) that fail inside Docker on a developer machine and are
+  # correct to fail there.
+  #
+  # A `stream` profile as well as `full`, so streaming can be exercised without
+  # standing up four Airflow containers alongside it.
+  # --------------------------------------------------------------------------
+  redpanda:
+    image: redpandadata/redpanda:v24.3.6
+    profiles: [stream, full]
+    container_name: meridian-redpanda
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --check=false
+      - --node-id=0
+      # Two listeners, and both are needed. Clients inside the compose network
+      # resolve `redpanda:9092`; clients on the host resolve `localhost:19092`.
+      # A broker advertises the address it wants clients to reconnect on after
+      # metadata discovery, so a single listener works for exactly one of those
+      # two and fails the other with a name-resolution error that looks like the
+      # broker is down.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "${KAFKA_EXTERNAL_PORT:-19092}:19092"
+      - "${REDPANDA_ADMIN_PORT:-9644}:9644"
+    healthcheck:
+      # `cluster health` rather than a port check: the port accepts connections
+      # before the cluster has elected a controller leader, so a TCP probe goes
+      # green while `create_topics` still fails.
+      test: ["CMD-SHELL", "rpk cluster health -X brokers=localhost:9092 | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Redpanda Console — a browser view of topics, groups and lag.
+  #
+  # Not required by anything. It is here because "consumer group offsets are
+  # independent" is a claim, and watching two groups sit at different offsets on
+  # the same topic is the demonstration.
+  # --------------------------------------------------------------------------
+  redpanda-console:
+    image: redpandadata/console:v2.8.2
+    profiles: [stream, full]
+    container_name: meridian-redpanda-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "${REDPANDA_CONSOLE_PORT:-8090}:8080"
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
   # Airflow 3.1.3, LocalExecutor. CONTRACTS.md §6.
   #
   # Pinned to the exact patch, because Airflow's constraints branch is named per
@@ -183,6 +257,9 @@ services:
         POSTGRES_HOST: postgres
         POSTGRES_PORT: "5432"
         MINIO_ENDPOINT: http://minio:9000
+        # The in-network broker address. `.env` carries the host one, for the
+        # same reason it carries POSTGRES_HOST=localhost.
+        KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
         MINIO_ROOT_USER: ${MINIO_ROOT_USER}
         MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
         LAKE_BUCKET: ${LAKE_BUCKET:-meridian-lake}

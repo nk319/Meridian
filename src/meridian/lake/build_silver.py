@@ -109,7 +109,7 @@ def judged_cte(spec: SilverSpec, glob: str) -> str:
     """Bronze, deduped by hash, with a verdict attached to every row."""
     return f"""
     WITH bronze AS (
-        SELECT * FROM read_parquet('{glob}')
+        SELECT * FROM read_parquet({glob})
     ),
     dedup_hash AS (
         SELECT * EXCLUDE (_rn) FROM (
@@ -190,9 +190,7 @@ def assert_no_restricted_columns(
     scrubbing nothing, this asserts that there was nothing to scrub, reading the
     restricted list from the governance file rather than a hardcoded copy.
     """
-    present = {
-        r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{glob}')").fetchall()
-    }
+    present = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet({glob})").fetchall()}
     leaked = present & restricted_column_names()
     if leaked:
         raise RuntimeError(
@@ -227,16 +225,35 @@ class EntityResult:
 def build_entity(
     con: duckdb.DuckDBPyConnection, spec: SilverSpec, cfg: Settings, run_id: uuid.UUID
 ) -> EntityResult:
-    glob = bronze_glob(cfg.lake_bucket, spec.source, spec.entity)
-    if not con.execute(f"SELECT count(*) FROM glob('{glob}')").fetchone()[0]:
+    # Every Bronze source that carries this entity, minus the ones with nothing
+    # in them. Filtering is not optional: `read_parquet` on a glob matching no
+    # file is an error, so an entity whose streaming sink has never run would
+    # fail to build at all — and the streaming path must be optional.
+    present = [
+        candidate
+        for candidate in (
+            bronze_glob(cfg.lake_bucket, source, spec.entity) for source in spec.all_sources
+        )
+        if con.execute(f"SELECT count(*) FROM glob('{candidate}')").fetchone()[0]
+    ]
+    if not present:
         raise FileNotFoundError(
-            f"no Bronze for {spec.entity} at {glob}. Run "
+            f"no Bronze for {spec.entity} under any of {list(spec.all_sources)}. Run "
             f"`python -m meridian.ingest.{spec.source} --mode full` first."
         )
 
+    # A DuckDB list literal when there is more than one, a quoted string when
+    # there is one. `read_parquet` accepts both, and keeping the single-source
+    # case a plain string keeps the generated SQL readable in a log.
+    glob = (
+        f"'{present[0]}'"
+        if len(present) == 1
+        else "[" + ", ".join(f"'{path}'" for path in present) + "]"
+    )
+
     assert_no_restricted_columns(con, spec, glob)
 
-    bronze_rows = con.execute(f"SELECT count(*) FROM read_parquet('{glob}')").fetchone()[0]
+    bronze_rows = con.execute(f"SELECT count(*) FROM read_parquet({glob})").fetchone()[0]
     counts = con.execute(
         f"{judged_cte(spec, glob)} "
         f"SELECT count(*), count(*) FILTER (WHERE _quarantine_reason IS NOT NULL) FROM judged"

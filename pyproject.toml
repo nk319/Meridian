@@ -26,6 +26,16 @@ rag = [
     "fastembed>=0.4",
     "anthropic>=0.40",
 ]
+# Phase 5. Optional for the same reason as `rag`: the batch platform is complete
+# without a broker, and `pip install -e .` should not pull librdkafka for
+# someone who only wants to run the pipeline.
+stream = [
+    "confluent-kafka>=2.5",
+    # Avro, without a Schema Registry. fastavro rather than the reference
+    # `avro` package: it is an order of magnitude faster at the per-message
+    # encode this does thousands of times, and ships manylinux wheels.
+    "fastavro>=1.9",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",

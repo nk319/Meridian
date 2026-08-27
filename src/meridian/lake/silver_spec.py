@@ -70,6 +70,25 @@ class SilverSpec:
     # Columns Bronze carries for capture machinery that Silver has no use for.
     drop: tuple[str, ...] = field(default_factory=tuple)
 
+    # Additional Bronze sources carrying the same entity.
+    #
+    # `source` is the entity's owner under the CONTRACTS.md §12 one-entity-one-
+    # owner rule, and that rule is what makes the four batch ingestors safe to
+    # run in parallel. The streaming path does not break it: `bronze-sink`
+    # writes the same events the `files` ingestor captures, under
+    # `source='stream'`, and Silver's dedup on the natural key collapses the two
+    # captures of one event into one row.
+    #
+    # That collapse is the point. Batch and stream are two views of the same
+    # world with different latency, and reconciling them here — rather than
+    # publishing two tables and hoping nobody joins them — is what stops the
+    # Lambda shape becoming two systems that disagree.
+    also_from: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def all_sources(self) -> tuple[str, ...]:
+        return (self.source, *self.also_from)
+
     @property
     def business_columns(self) -> tuple[str, ...]:
         return tuple(c.name for c in self.columns)
@@ -162,6 +181,8 @@ SPECS: dict[str, SilverSpec] = {
     "web_events": SilverSpec(
         entity="web_events",
         source="files",
+        # The one entity captured on both paths. See `also_from` above.
+        also_from=("stream",),
         key=("event_id",),
         recency="event_ts",
         columns=(
