@@ -36,3 +36,6 @@ logs/
 .DS_Store
 .vscode/
 .idea/
+
+# Staged at build time by `make airflow-build`; environment-specific, never committed.
+airflow/certs/*.crt

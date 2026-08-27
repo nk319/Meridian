@@ -5,7 +5,7 @@ streaming ingestion, a Parquet lakehouse, a dimensional warehouse, orchestration
 data quality, governance, and a retrieval-augmented AI layer over customer
 support history.
 
-> **Build status: Phase 2 of 8 complete.** This README describes the system being
+> **Build status: Phase 3 of 8 complete.** This README describes the system being
 > built. Sections marked *planned* are not implemented yet. See
 > [`docs/PROGRESS.md`](docs/PROGRESS.md) for exactly what exists today — it is
 > updated at the end of every work session and is the resume point.
@@ -98,7 +98,7 @@ cp .env.example .env      # then set the passwords; nothing has a default
 make venv                 # .venv with the rag and dev extras
 make seed                 # generate all source data (deterministic, ~15s)
 make up                   # Postgres (pgvector) + MinIO, waits for health
-make pipeline             # source system -> Bronze -> Silver -> warehouse
+make pipeline             # source system -> Bronze -> Silver -> warehouse -> DQ
 make rag-index            # chunk, mask, embed, upsert  (~3 min first run)
 make rag-eval             # measure recall@5 against the golden set
 make test                 # the full suite
@@ -168,6 +168,66 @@ pipeline looks clean precisely because the bad data vanished. Admitting them wit
 `OR ts IS NULL` then re-captures the same rows on every run, forever. They are
 admitted exactly once, by anti-joining the record hash against what Bronze
 already holds.
+
+Then orchestrate it:
+
+```bash
+make airflow-build        # three isolated interpreters in one image
+make airflow-up           # http://localhost:8080
+```
+
+---
+
+## Data quality
+
+Three layers, and each catches what the others structurally cannot.
+
+CHECK constraints protect the **write** path — nothing violating a frozen
+vocabulary can be inserted. `build_silver` protects the **load** — a row that
+fails to type is quarantined with its reason and original value. `meridian.dq.run`
+runs **after** load, and asserts the two things per-row rules cannot see:
+relationships between tables, and distributions across them.
+
+That last one is the interesting layer. A CHECK constraint cannot know that an
+order references a customer who doesn't exist, that 72% of orders are usually
+delivered, or that the catalogue runs at 43% margin. Every row can be
+individually valid while the set as a whole is wrong — which is exactly how an
+upstream change arrives.
+
+38 checks across five suites. `BLOCK` exits 2 and stops the pipeline; `WARN` is
+recorded and visible. Every non-zero tolerance says why it exists.
+
+The worked example is `fk_order_items_product_id`. Quarantine fans out: three
+rejected product rows — 1.36% of the catalogue — orphan 380 order lines, 1.46% of
+that table. Those lines are perfectly valid and will silently disappear from any
+join to `dim_product`. Blocking the pipeline would be wrong. Saying nothing would
+be worse. So it runs at WARN with a 3% tolerance, sized to pass today and fire if
+product rejection meaningfully worsens.
+
+---
+
+## Orchestration
+
+Airflow 3.1.3, `LocalExecutor`, pinned to the exact patch because the constraints
+branch is named per patch.
+
+The image carries **three Python environments**, and that is forced rather than
+tidy-minded:
+
+| Environment | protobuf |
+| --- | ---: |
+| Airflow's own | 4.25.8 |
+| `/opt/dbt-venv` | 6.33.6 |
+| `/opt/meridian-venv` | the pipeline, incl. onnxruntime via fastembed |
+
+CONTRACTS §6 predicted the dbt conflict. The RAG layer turned out to have the
+same one. So **every task is a subprocess** invoked by absolute path, and no DAG
+imports anything from `meridian` — which is what lets `make pipeline` prove the
+platform works with the orchestrator switched off.
+
+`meridian_rag` is scheduled on an **asset**, not a cron expression: the batch
+DAG's warehouse load declares `meridian://silver/support_tickets` as an outlet,
+and indexing runs when the tickets it indexes have actually landed.
 
 ---
 
@@ -244,6 +304,11 @@ src/meridian/
     files.py        CSV drop, captured as text because it carries defects
     restapi.py      the platform's own API (a JSON document until Phase 6)
     vendor.py       paginated vendor feed, follows next_cursor
+  dq/
+    checks.py       declarative SQL assertions with a reproduction query
+    suites.py       referential, business, volume, freshness — every bound measured
+    schemas.py      Pandera frames: distribution, which per-row rules cannot see
+    run.py          `python -m meridian.dq.run --suite all`
   lake/
     layout.py       the frozen §2 paths and the six Bronze metadata columns
     duck.py         DuckDB wired to MinIO, timezone pinned
@@ -290,6 +355,12 @@ A map of each concept to the file that demonstrates it lives in
 | Quarantine with a machine-readable reason | `lake/build_silver.py`, `meta.dq_check_results` |
 | Streaming load in bounded memory | `lake/load_warehouse.py` — Arrow + binary COPY |
 | PII physically excluded from the lake | `load_warehouse.load_customer_pii`, `tests/test_pii_boundary.py` |
+| Data quality by layer (write / load / post-load) | CHECK constraints, `build_silver.py`, `meridian/dq/` |
+| Distribution checks vs. per-row rules | `src/meridian/dq/schemas.py` |
+| Severity-driven pipeline gating | `dq/checks.py`, exit code 2 |
+| Orchestration without import coupling | `airflow/dags/`, `airflow/Dockerfile` |
+| Dependency isolation by interpreter | `airflow/Dockerfile` — protobuf 4.25.8 vs 6.33.6 |
+| Data-aware (asset) scheduling | `airflow/dags/meridian_rag.py` |
 
 ---
 

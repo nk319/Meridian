@@ -30,12 +30,24 @@ ROLE_PASSWORD_ENV = {
 
 
 def project_root() -> Path:
-    """The repository root: the nearest ancestor holding pyproject.toml.
+    """Where `seeds/`, `eval/` and `docs/governance/` live.
 
-    Resolved from this file rather than from the working directory, so seeds and
-    contracts are found identically whether the caller is pytest, `make`, or an
-    Airflow task with a working directory of its own.
+    Normally the repository root, found by walking up from this file to the
+    nearest `pyproject.toml` — resolved from the module rather than the working
+    directory, so the answer is the same for pytest, `make`, and an Airflow task
+    with a working directory of its own.
+
+    `MERIDIAN_ROOT` overrides it, and that is not a convenience knob. Once the
+    package is installed rather than run from a checkout — as it is inside the
+    Airflow image, in its own venv under /opt — there is no `pyproject.toml`
+    above it and the walk falls through to `site-packages`. Every path derived
+    from it then points somewhere plausible and empty, so the failure is
+    "0 tickets found" rather than an error naming a directory.
     """
+    override = os.environ.get("MERIDIAN_ROOT", "").strip()
+    if override:
+        return Path(override).resolve()
+
     here = Path(__file__).resolve()
     for candidate in here.parents:
         if (candidate / "pyproject.toml").is_file():

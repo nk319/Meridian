@@ -38,12 +38,18 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# ddl.sql ships inside the package because the indexer owns the rag schema and
-# applies it at startup (CONTRACTS.md §11). Without this it survives an editable
-# install and vanishes from a wheel, which fails at the first `make rag-index`
-# on a real deployment and nowhere earlier.
+# The components that own a schema ship its DDL inside the package and apply it
+# at startup: the indexer owns `rag` (CONTRACTS.md §11) and the pipeline owns
+# meta/silver/secure (§12). Without this those files survive an editable install
+# and vanish from a wheel.
+#
+# A glob rather than a package-by-package list, because the narrow version was
+# already wrong once: `meridian.rag` was listed, `meridian.warehouse` was added
+# later, and nothing noticed until a task ran from an installed copy inside the
+# Airflow image and died on a missing warehouse/ddl.sql. From a source checkout
+# the file is simply there, so every local run and every test passed.
 [tool.setuptools.package-data]
-"meridian.rag" = ["*.sql"]
+"*" = ["*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

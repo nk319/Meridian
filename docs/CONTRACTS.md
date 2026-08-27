@@ -548,6 +548,88 @@ such a column ever appears in Bronze.
 
 ---
 
+## 13. Data quality and orchestration
+
+Added in Phase 3.
+
+### Where a rule lives decides what it can catch
+
+Three layers, and each one asserts something the others structurally cannot:
+
+| Layer | Mechanism | Catches |
+| --- | --- | --- |
+| Write path | CHECK constraints (`db/init`, `warehouse/ddl.sql`) | a row that violates a frozen vocabulary, at insert |
+| Load path | `lake/build_silver.py` | a row that fails to type or parse — quarantined with a reason |
+| Post-load | `meridian.dq.run` | **relationships and distributions** |
+
+The third is the one worth naming. A CHECK constraint is per-row: it cannot know
+that an order references a customer who does not exist, that 72% of orders are
+usually delivered, or that the catalogue runs at 43% margin. Every individual row
+can be valid while the set as a whole is wrong, and that is precisely how an
+upstream change arrives.
+
+Suites: `referential`, `business`, `volume`, `freshness` (SQL, `source='custom'`)
+and `schema` (Pandera, `source='pandera'`). `all` is their union.
+
+### Severity decides consequence, not importance
+
+`BLOCK` exits 2 and stops the pipeline. `WARN` is recorded and visible. Every
+non-zero tolerance states its reason in `dq/suites.py` — a threshold picked by
+guessing either never fires or always does.
+
+The worked example is `fk_order_items_product_id`, which runs at WARN with a 3%
+tolerance. Quarantine fans out: three rejected product rows (1.36% of the
+catalogue) orphan 380 order lines (1.46% of the table). Those lines are valid and
+will silently vanish from any join to `dim_product`. Blocking the pipeline would
+be wrong; saying nothing would be worse.
+
+### Freshness is about the pipeline, not the data
+
+The generator writes to a fixed anchor date, so the newest order is always the
+same age and a check on `max(order_ts)` would fail purely because time passed.
+Freshness asserts that the last successful run of each step completed recently,
+which is the thing that is actually true or false about a running platform.
+
+### Orchestration
+
+**Airflow 3.1.3**, pinned to the patch — the constraints branch is named per
+patch and `constraints-3.1.x` does not exist. `LocalExecutor`.
+
+The image carries **three Python environments**, and the separation is forced
+rather than stylistic:
+
+| Environment | Holds | protobuf |
+| --- | --- | ---: |
+| Airflow's own | the scheduler, api-server and dag-processor | 4.25.8 |
+| `/opt/meridian-venv` | the pipeline and every dependency it has | — |
+| `/opt/dbt-venv` | dbt | 6.33.6 |
+
+§6 required the dbt split for exactly that pin. The same argument turned out to
+apply to the RAG layer, which pulls onnxruntime through fastembed and has its own
+protobuf floor — so the pipeline got the same treatment rather than a special
+case. `airflow/Dockerfile` asserts all three still import at build time.
+
+The consequence is the property §5 asked for: **every task is a subprocess, and
+no DAG imports anything from `meridian`.** That is what lets `make pipeline`
+prove the platform works with the orchestrator switched off, and it means a
+pipeline dependency change cannot take the scheduler down.
+
+### Data-aware scheduling
+
+`meridian_batch`'s warehouse load declares `meridian://silver/support_tickets` as
+an outlet; `meridian_rag` is scheduled **on that asset** rather than on a cron
+expression. Indexing runs when the tickets it indexes have landed, instead of at
+a time somebody guessed the batch would be done by. Re-indexing is cheap by
+design — the content hash means an unchanged corpus re-embeds nothing — so a
+spurious trigger costs seconds.
+
+Airflow's metadata lives in the `airflow` database under its own `airflow` role,
+which owns that database and holds nothing in `oltp` or `warehouse`. A
+compromised orchestrator cannot read the warehouse; no pipeline role can perturb
+Airflow's bookkeeping.
+
+---
+
 ## Deviations from the plan
 
 | Plan said        | Built as   | Why                                                    |
@@ -563,3 +645,5 @@ such a column ever appears in Bronze.
 | §2: six Bronze metadata columns | four of them reach Silver | `_source_file` and `_batch_seq` describe a physical file. After dedup across runs a Silver row corresponds to no single file, so carrying them would mean presenting an arbitrary winner's filename as provenance. |
 | `order_items` as the source has it | Bronze also carries `order_ts` | The source table has no timestamp of its own, so without the parent order's it could only ever be full-refreshed — a full reload of the largest child table on every run is what incremental ingestion exists to avoid. Dropped again in Silver; it is capture machinery, not a business column. |
 | §9 has no `ticket_channel` | `email`, `chat`, `phone`, `web_form` | Same gap as `ticket_status`, and worse because the name collides: §9's frozen `channel` is the marketing channel on orders and web events. Both are enforced as CHECK constraints; promote both in Phase 4. |
+| §6: dbt isolated from Airflow | **and the pipeline isolated too** | §6 named one irreconcilable pin. There are two: fastembed pulls onnxruntime, which has its own protobuf floor and would break Airflow exactly as dbt would. Three interpreters, not two. |
+| §1: five roles | six — `airflow` added | §1 describes the `airflow` database as "metadata only" but named no role for it, so no role could connect to it at all. The new role owns that database and holds nothing anywhere else. |

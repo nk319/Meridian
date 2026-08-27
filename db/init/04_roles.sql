@@ -14,18 +14,20 @@
 \set dbt_pw ''
 \set ro_pw  ''
 \set rag_pw ''
+\set airflow_pw ''
 
 \getenv app_pw MERIDIAN_APP_PASSWORD
 \getenv etl_pw MERIDIAN_ETL_PASSWORD
 \getenv dbt_pw DBT_RUNNER_PASSWORD
 \getenv ro_pw  ANALYTICS_RO_PASSWORD
 \getenv rag_pw RAG_INDEXER_PASSWORD
+\getenv airflow_pw AIRFLOW_DB_PASSWORD
 
 -- An unset variable and an empty one are the same mistake with different
 -- symptoms; both produce a login role with a blank password, which is worse
 -- than a failed build. Catch them together, before CREATE ROLE.
 SELECT (:'app_pw' = '' OR :'etl_pw' = '' OR :'dbt_pw' = ''
-        OR :'ro_pw' = '' OR :'rag_pw' = '') AS missing_pw \gset
+        OR :'ro_pw' = '' OR :'rag_pw' = '' OR :'airflow_pw' = '') AS missing_pw \gset
 
 \if :missing_pw
 \echo '>>> FATAL: one or more Meridian role passwords are unset or empty.'
@@ -33,9 +35,9 @@ DO LANGUAGE plpgsql $fatal$
 BEGIN
     RAISE EXCEPTION
         'Role passwords are unset or empty. Set MERIDIAN_APP_PASSWORD, '
-        'MERIDIAN_ETL_PASSWORD, DBT_RUNNER_PASSWORD, ANALYTICS_RO_PASSWORD and '
-        'RAG_INDEXER_PASSWORD in .env — see .env.example. Refusing to create '
-        'login roles with a blank password.';
+        'MERIDIAN_ETL_PASSWORD, DBT_RUNNER_PASSWORD, ANALYTICS_RO_PASSWORD, '
+        'RAG_INDEXER_PASSWORD and AIRFLOW_DB_PASSWORD in .env — see '
+        '.env.example. Refusing to create login roles with a blank password.';
 END
 $fatal$;
 \endif
@@ -50,11 +52,19 @@ CREATE ROLE dbt_runner    LOGIN PASSWORD :'dbt_pw';
 CREATE ROLE analytics_ro  LOGIN PASSWORD :'ro_pw';
 CREATE ROLE rag_indexer   LOGIN PASSWORD :'rag_pw';
 
+-- Airflow's own metadata role. §1 describes the `airflow` database as "metadata
+-- only, nothing else reads it", and this is what makes that true in both
+-- directions: the scheduler owns that database outright and holds nothing
+-- anywhere else, so a compromised orchestrator cannot read the warehouse, and no
+-- pipeline role can perturb Airflow's own bookkeeping.
+CREATE ROLE airflow       LOGIN PASSWORD :'airflow_pw';
+
 COMMENT ON ROLE meridian_app IS 'CRUD on oltp.*. No warehouse access.';
 COMMENT ON ROLE meridian_etl IS 'Read oltp.*; write silver.*, secure.*, meta.*.';
 COMMENT ON ROLE dbt_runner   IS 'Owns gold_stg, gold_int, gold. Reads silver.';
 COMMENT ON ROLE analytics_ro IS 'SELECT on gold and on the masked rag corpus. Nothing else.';
 COMMENT ON ROLE rag_indexer  IS 'Read silver.support_*; write rag.*. No secure grant.';
+COMMENT ON ROLE airflow      IS 'Owns the airflow metadata database. No access to oltp or warehouse.';
 
 -- --------------------------------------------------------------------------
 -- Database-level CONNECT.
@@ -71,6 +81,11 @@ REVOKE ALL ON DATABASE airflow   FROM PUBLIC;
 
 GRANT CONNECT ON DATABASE oltp      TO meridian_app, meridian_etl;
 GRANT CONNECT ON DATABASE warehouse TO meridian_etl, dbt_runner, analytics_ro, rag_indexer;
+GRANT CONNECT ON DATABASE airflow   TO airflow;
+
+-- Airflow runs its own schema migrations, so it needs to own the database it
+-- migrates rather than merely write to it.
+ALTER DATABASE airflow OWNER TO airflow;
 
 -- --------------------------------------------------------------------------
 -- oltp: the source system.

@@ -37,6 +37,7 @@ services:
       DBT_RUNNER_PASSWORD: ${DBT_RUNNER_PASSWORD:?set DBT_RUNNER_PASSWORD in .env}
       ANALYTICS_RO_PASSWORD: ${ANALYTICS_RO_PASSWORD:?set ANALYTICS_RO_PASSWORD in .env}
       RAG_INDEXER_PASSWORD: ${RAG_INDEXER_PASSWORD:?set RAG_INDEXER_PASSWORD in .env}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD in .env}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
@@ -121,6 +122,138 @@ services:
       "
     restart: "no"
 
+  # --------------------------------------------------------------------------
+  # Airflow 3.1.3, LocalExecutor. CONTRACTS.md §6.
+  #
+  # Pinned to the exact patch, because Airflow's constraints branch is named per
+  # patch — `constraints-3.1.x` does not exist, so "3.1" is not a thing you can
+  # install reproducibly.
+  #
+  # LocalExecutor: no Celery, no Redis, no worker fleet. The DAGs here fan out to
+  # at most five tasks and every one of them is a subprocess that shells out to
+  # another interpreter, so a distributed executor would add three moving parts
+  # to schedule work that a thread pool already handles.
+  #
+  # Airflow 3 splits what Airflow 2 called the webserver into an api-server, a
+  # scheduler and a dag-processor. They are separate services here rather than
+  # one container running three things, so a DAG parsing error cannot take the
+  # scheduler down with it.
+  # --------------------------------------------------------------------------
+  airflow-init:
+    <<: &airflow-common
+      image: meridian-airflow:3.1.3
+      build:
+        context: .
+        dockerfile: airflow/Dockerfile
+      profiles: [full]
+      depends_on:
+        postgres:
+          condition: service_healthy
+      environment: &airflow-env
+        AIRFLOW__CORE__EXECUTOR: LocalExecutor
+        AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+        AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+        AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set AIRFLOW_FERNET_KEY in .env}
+        AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+          postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@postgres:5432/airflow
+        AIRFLOW__API__SECRET_KEY: ${AIRFLOW_JWT_SECRET:?set AIRFLOW_JWT_SECRET in .env}
+        AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+        # Local development only. Everyone who can reach the port is an admin,
+        # which is acceptable for a stack bound to localhost and would not be
+        # anywhere else.
+        AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+        # Airflow 3 runs tasks through a Task Execution API rather than letting
+        # them touch the metadata database directly. The worker resolves that
+        # API from this setting, which defaults to localhost:8080 — correct for
+        # an all-in-one host, wrong for every split deployment including this
+        # one, where the api-server is a different container. Left unset, tasks
+        # queue, retry, and fail with `httpx.ConnectError: Connection refused`
+        # from inside the executor, which reads as a scheduler problem rather
+        # than a URL.
+        AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+        # DAG code is trusted here and parsing it is not a sandbox boundary.
+        AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
+
+        # --- what the pipeline subprocesses read ---------------------------
+        # The package lives in /opt/meridian-venv with no pyproject.toml above
+        # it, so the usual walk-up cannot find the project root. Without this
+        # every seeds/ and eval/ path resolves inside site-packages and the
+        # failure is an empty result rather than an error.
+        MERIDIAN_ROOT: /opt/meridian
+        POSTGRES_HOST: postgres
+        POSTGRES_PORT: "5432"
+        MINIO_ENDPOINT: http://minio:9000
+        MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+        MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+        LAKE_BUCKET: ${LAKE_BUCKET:-meridian-lake}
+        MERIDIAN_APP_PASSWORD: ${MERIDIAN_APP_PASSWORD}
+        MERIDIAN_ETL_PASSWORD: ${MERIDIAN_ETL_PASSWORD}
+        DBT_RUNNER_PASSWORD: ${DBT_RUNNER_PASSWORD}
+        ANALYTICS_RO_PASSWORD: ${ANALYTICS_RO_PASSWORD}
+        RAG_INDEXER_PASSWORD: ${RAG_INDEXER_PASSWORD}
+        ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+        ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5}
+        EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
+        RAG_ABSTAIN_SIMILARITY: ${RAG_ABSTAIN_SIMILARITY:-0.68}
+      volumes:
+        - ./airflow/dags:/opt/airflow/dags:ro
+        # Mounted rather than baked: seeds are 23 MB of regenerable data, and the
+        # governance file and golden question set are things you want to edit
+        # without rebuilding a 4 GB image.
+        - ./seeds:/opt/meridian/seeds:ro
+        - ./docs:/opt/meridian/docs:ro
+        - ./eval:/opt/meridian/eval:ro
+        - ./contracts:/opt/meridian/contracts:ro
+        - airflow-logs:/opt/airflow/logs
+    container_name: meridian-airflow-init
+    # `db migrate` is idempotent, so this runs on every `up` rather than being a
+    # one-time step whose absence surfaces as an unexplained schema error.
+    command: >-
+      bash -c "airflow db migrate && echo 'airflow metadata database ready'"
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: meridian-airflow-apiserver
+    command: api-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: meridian-airflow-scheduler
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: meridian-airflow-dag-processor
+    command: dag-processor
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
 volumes:
   postgres-data:
   minio-data:
+  airflow-logs:
