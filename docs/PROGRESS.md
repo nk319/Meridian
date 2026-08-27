@@ -12,7 +12,7 @@ history, which does not survive a container restart.
 | --- | --- |
 | **Phase** | 1 — AI/RAG core |
 | **Status** | ✅ Complete |
-| **Tag** | `phase-1` |
+| **Tag** | `phase-1`, on branch `claude/phase-1-setup-8lokjp` until it merges |
 | **Next phase** | 2 — Batch ingestion and the lakehouse |
 | **Next action** | Land Bronze Parquet on MinIO from the five seed sources, then prove the DuckDB → Arrow → `COPY` hop into `silver` before writing any warehouse code (CONTRACTS.md §3) |
 
@@ -125,6 +125,12 @@ values masked (100% by dictionary, 0% by regex fallback).
 while every Phase 0 artifact existed solely under the `phase-0` tag with no
 branch reachable from it. `main` was reset to `phase-0` and force-pushed, and the
 Phase 1 branch rebuilt from it.
+
+The lesson generalises to how phases are tagged. A `phase-N` tag is the documented
+resume point, so it has to stay reachable: `phase-1` is on the pushed branch, and
+if that branch is ever squash-merged the tag must be moved to the resulting commit
+on `main` rather than left pointing at history no branch contains. That is exactly
+how `phase-0` became unreachable.
 
 ---
 
