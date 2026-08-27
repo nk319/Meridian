@@ -83,6 +83,15 @@ GRANT CONNECT ON DATABASE oltp      TO meridian_app, meridian_etl;
 GRANT CONNECT ON DATABASE warehouse TO meridian_etl, dbt_runner, analytics_ro, rag_indexer;
 GRANT CONNECT ON DATABASE airflow   TO airflow;
 
+-- dbt snapshots stage the incoming rows in a temporary table before merging
+-- them, so a role that can create every table in three schemas still cannot run
+-- `dbt snapshot` without this. TEMP is granted to PUBLIC by default and the
+-- REVOKE above takes it away — correctly, since PUBLIC includes every role in
+-- the cluster; this hands it back to the one role that needs it. Temporary
+-- tables live in a per-session schema that no other session can see, so this
+-- widens nothing that `secure` cares about.
+GRANT TEMPORARY ON DATABASE warehouse TO dbt_runner;
+
 -- Airflow runs its own schema migrations, so it needs to own the database it
 -- migrates rather than merely write to it.
 ALTER DATABASE airflow OWNER TO airflow;
@@ -170,6 +179,25 @@ ALTER DEFAULT PRIVILEGES FOR ROLE meridian_etl IN SCHEMA meta
 -- dbt reads silver; the tables are created later by meridian_etl, so this is
 -- the default-privilege half and warehouse/ddl.sql carries the explicit half.
 ALTER DEFAULT PRIVILEGES FOR ROLE meridian_etl IN SCHEMA silver
+    GRANT SELECT ON TABLES TO dbt_runner;
+
+-- dbt also reads `rag`, for one table: rag.ticket_enrichment, the LLM's
+-- predicted intent and sentiment. §8 makes gold.fact_support_tickets carry the
+-- AI enrichment and says mart_support_health "depends structurally on the AI
+-- enrichment columns" — deliberately, so the AI layer cannot become a side
+-- attachment nothing consumes. §1 says dbt reads silver. Both cannot hold
+-- unless the enrichment lands somewhere dbt can see it.
+--
+-- Resolved towards `rag` rather than `silver`, because the alternative is
+-- worse in two ways at once: it would make rag_indexer a writer of `silver`
+-- (§1 says the loader writes silver, and gives rag_indexer read on
+-- silver.support_* and write on rag.* only), and it would put a model's output
+-- in a layer defined as cleaned source data. The read is safe for the same
+-- reason analytics_ro's is: `rag` holds masked text by construction, and the
+-- enrichment table holds labels drawn from a frozen vocabulary — no free text
+-- at all. Recorded as a deviation in CONTRACTS.md.
+GRANT USAGE ON SCHEMA rag TO dbt_runner;
+ALTER DEFAULT PRIVILEGES FOR ROLE rag_indexer IN SCHEMA rag
     GRANT SELECT ON TABLES TO dbt_runner;
 
 -- `secure` is the PII schema. Nobody but the ETL touches it. PUBLIC never had

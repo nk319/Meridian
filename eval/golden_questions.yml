@@ -130,7 +130,11 @@ questions:
       content_contains: ["bulk discount"]
 
   - id: order_reference_lookup
-    question: What is the problem reported on order O0000019?
+    # `{singleton_order_id}` is substituted from seeds/manifest.json before the
+    # question is asked. The question text and the relevance spec below resolve
+    # from the same anchor, so they cannot come to name different orders — which
+    # would score a correct answer as a miss and read as a retrieval bug.
+    question: What is the problem reported on order {singleton_order_id}?
     expects_answer: true
     # The one question on this set that discriminates between the two rankers,
     # and the reason it is here.
@@ -142,18 +146,25 @@ questions:
     #
     # This one names an identifier that occurs in exactly one of the 1,311
     # tickets, wrapped in ordinary words. The wrapping is the point: vector
-    # search handles the bare token "O0000019" perfectly, and only loses it when
+    # search handles the bare order token perfectly, and only loses it when
     # the embedding is diluted by problem/reported/order. BM25 gives a token
     # appearing in one document a very high IDF regardless of phrasing and finds
     # it at rank 1. It is the case hybrid retrieval exists for, so the eval
     # should contain it rather than assert it.
     #
-    # Bound to the pinned generator seed (config.DEFAULT_SEED), as the Phase 0
-    # row-count assertions already are. Regenerating with different volumes
-    # makes build_relevance fail with a message naming this question, rather
-    # than silently scoring zero and reading as a retrieval regression.
+    # NOT bound to a literal. It was, and that broke: a genuine bug fix in the
+    # generator — a hard-deleted customer whose signup date landed after their
+    # deletion — shifted the order sequence, and the hardcoded reference stopped
+    # occurring in any ticket. `build_relevance` refused to score it, which is
+    # the guard working, but the obvious repair was to paste in another literal
+    # and reset the clock on the same failure.
+    #
+    # So the generator publishes the anchor instead (meridian/seed/anchors.py):
+    # an order reference occurring in exactly one of the tickets it just wrote.
+    # The property this question depends on is then established against the
+    # corpus that exists rather than asserted about one that used to.
     relevant:
-      content_contains: ["O0000019"]
+      content_from_anchor: [singleton_order_id]
 
   # -------------------------------------------------------------------------
   # Must abstain — off-domain for a support-ticket corpus

@@ -1,7 +1,8 @@
 .PHONY: help venv seed test lint clean up down reset ps logs bootstrap load-oltp \
         ingest ingest-incremental silver load-warehouse pipeline dq \
         airflow-build airflow-up airflow-down airflow-logs airflow-test \
-        rag-index rag-reindex rag-eval ask search verify
+        rag-index rag-reindex rag-eval rag-enrich ask search verify \
+        dbt-venv dbt-run dbt-test dbt-snapshot dbt-snapshot-backfill dbt-results dbt-docs gold
 
 # Prefer the project venv when one exists. The RAG layer needs psycopg,
 # fastembed and pgvector; the seed generator is stdlib-only and runs anywhere.
@@ -101,6 +102,49 @@ airflow-test:  ## Parse the DAGs and report import errors
 	docker compose --profile full run --rm airflow-init bash -c \
 	  "airflow dags list && airflow dags list-import-errors"
 
+# --------------------------------------------------------------------------
+# dbt. A separate interpreter from .venv, mirroring the production split — see
+# CONTRACTS.md §6: Airflow pins protobuf 4.x and dbt-core requires 6.x, and
+# keeping the same separation locally means `make dbt-run` exercises the same
+# arrangement the image does rather than a friendlier one.
+# --------------------------------------------------------------------------
+DBT := $(shell [ -x .dbt-venv/bin/dbt ] && echo .dbt-venv/bin/dbt || echo dbt)
+DBT_RUN := cd dbt && DBT_PROFILES_DIR=$(CURDIR)/dbt $(CURDIR)/$(DBT)
+
+dbt-venv:  ## Create .dbt-venv, separate from .venv on purpose
+	python3 -m venv .dbt-venv
+	.dbt-venv/bin/python -m pip install --upgrade pip
+	.dbt-venv/bin/python -m pip install "dbt-core>=1.9,<2" "dbt-postgres>=1.9,<2"
+
+dbt-snapshot:  ## Advance the SCD2 snapshot by one observation. Idempotent.
+	$(DBT_RUN) snapshot
+
+dbt-snapshot-backfill:  ## ONE TIME: replay the change log into the snapshot
+	./scripts/dbt_snapshot_backfill.sh
+
+dbt-run:  ## Build gold_stg -> gold_int -> gold
+	$(DBT_RUN) run
+
+dbt-test:  ## Run every dbt assertion, including the four singular SCD2 tests
+	$(DBT_RUN) test
+
+dbt-results:  ## Parse dbt's run_results.json into meta.dq_check_results
+	$(RUN) -m meridian.dbt.results
+
+dbt-docs:  ## Generate and serve the model lineage graph on :8081
+	$(DBT_RUN) docs generate
+	$(DBT_RUN) docs serve --port 8081
+
+gold:  ## The whole transform layer, in the order the DAG runs it
+	$(MAKE) rag-enrich
+	$(MAKE) dbt-snapshot-backfill
+	$(MAKE) dbt-run
+	$(MAKE) dbt-test
+	$(MAKE) dbt-results
+
+rag-enrich:  ## Classify tickets with the LLM. No-ops without an ANTHROPIC_API_KEY.
+	$(RUN) -m meridian.rag.enrich --limit 200
+
 rag-index:  ## Chunk, mask, embed and upsert the ticket corpus
 	$(RUN) -m meridian.rag.index
 
@@ -129,9 +173,10 @@ verify:  ## Everything the README claims, from a cold start
 	$(MAKE) up
 	$(MAKE) pipeline
 	$(MAKE) rag-index
+	$(MAKE) gold
 	$(MAKE) test
 	$(MAKE) rag-eval
 
 clean:  ## Remove generated data
-	rm -rf seeds/ .pytest_cache/ .ruff_cache/
+	rm -rf seeds/ .pytest_cache/ .ruff_cache/ dbt/target/ dbt/logs/
 	find . -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true

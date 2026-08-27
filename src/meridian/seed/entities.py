@@ -132,6 +132,16 @@ def enrich_customers(
     deleted = by_id.get(C.HARD_DELETE_CUSTOMER_ID)
     if deleted is not None:
         when = anchor - dt.timedelta(days=C.HARD_DELETE_DAYS_AGO)
+        # Signup has to precede the deletion, the same way the demo customer's
+        # precedes its first transition. The random skew above is free to place
+        # this customer's signup anywhere in the window, and when it landed
+        # after `when` the result was a customer deleted four months before
+        # they existed — which every point-in-time reconstruction correctly
+        # excluded at every date, so the row never entered the snapshot and
+        # `hard_deletes='new_record'` was never exercised at all. The seed was
+        # wrong in a way that made the feature it exists to demonstrate
+        # silently untested.
+        deleted["signup_date"] = (when - dt.timedelta(days=180)).isoformat()
         deleted["is_deleted"] = "true"
         deleted["updated_at"] = f"{when.isoformat()}T12:00:00+00:00"
         change_log.append(

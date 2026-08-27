@@ -49,6 +49,60 @@ def load_golden(path: Path | None = None) -> dict:
     return doc
 
 
+def load_anchors(corpus_path: Path) -> dict:
+    """Generator-published values the golden set is allowed to name.
+
+    `seeds/manifest.json` sits two directories above the corpus. Read leniently:
+    an absent or unreadable manifest is not an error here, it just means no
+    question may use `content_from_anchor` — and the one that does will fail
+    below with a message naming itself, which is more useful than a
+    FileNotFoundError naming the manifest.
+    """
+    manifest = corpus_path.parent.parent / "manifest.json"
+    if not manifest.is_file():
+        return {}
+    try:
+        return json.loads(manifest.read_text(encoding="utf-8")).get("eval_anchors", {})
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+class _Anchors(dict):
+    """A format mapping that leaves unknown placeholders alone.
+
+    `str.format_map` raises on a missing key, which would turn any brace a
+    question author writes for other reasons into a crash at eval time. Leaving
+    it verbatim means an unresolved placeholder shows up in the reported
+    question text, where a human reads it, rather than as a KeyError naming a
+    word.
+    """
+
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def resolve_anchors(golden: dict, corpus_path: Path) -> dict:
+    """Substitute generator-published anchors into the question text.
+
+    The relevance spec and the question a retriever is actually handed have to
+    name the same identifier, or the question asks about one order and is scored
+    against another — which looks exactly like a retrieval failure. Both sides
+    resolve from `seeds/manifest.json`, so they cannot drift apart.
+
+    Returns a new document; the loaded YAML is not mutated, because
+    `tests/test_rag_retrieval.py` loads it once per session and a mutation would
+    make test order significant.
+    """
+    anchors = _Anchors(load_anchors(corpus_path))
+    return {
+        **golden,
+        "questions": [
+            {**q, "question": str(q["question"]).format_map(anchors)}
+            for q in golden.get("questions", [])
+        ],
+    }
+
+
 def build_relevance(golden: dict, corpus_path: Path, masker: Masker) -> dict[str, set[str]]:
     """Ticket IDs that count as relevant, per question.
 
@@ -56,6 +110,7 @@ def build_relevance(golden: dict, corpus_path: Path, masker: Masker) -> dict[str
     never from retrieval output. See the header of golden_questions.yml for why
     that distinction is the whole point of this function.
     """
+    anchors = load_anchors(corpus_path)
     # Ground truth comes from the generated corpus, not from silver, and
     # deliberately so: `intent` is the label the generator assigned before any
     # of this existed. Reading it back out of the warehouse would work equally
@@ -82,6 +137,22 @@ def build_relevance(golden: dict, corpus_path: Path, masker: Masker) -> dict[str
         spec = q.get("relevant") or {}
         intent = spec.get("intent")
         needles = [c.lower() for c in spec.get("content_contains", [])]
+
+        # Anchors, resolved from what the generator actually produced. A
+        # literal identifier written into the YAML is correct until the day the
+        # generator changes for an unrelated reason, and then it silently
+        # matches nothing; naming the anchor instead moves the coupling to a
+        # value that is recomputed with the corpus.
+        for anchor in spec.get("content_from_anchor", []):
+            value = anchors.get(anchor)
+            if not value:
+                raise ValueError(
+                    f"golden question {q['id']!r} needs the {anchor!r} anchor, which "
+                    f"seeds/manifest.json does not publish. Re-run `make seed`; if it "
+                    f"is still missing, the generator could not find one and the "
+                    f"question needs rewriting rather than repointing."
+                )
+            needles.append(str(value).lower())
         hits = {
             ticket_id
             for ticket_id, (row_intent, text) in masked.items()
@@ -383,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
     golden = load_golden()
     masker = Masker.from_project()
     corpus_path = cfg.seeds_dir / "rag" / "support_tickets.jsonl"
+    golden = resolve_anchors(golden, corpus_path)
     relevance = build_relevance(golden, corpus_path, masker)
 
     with corpus_path.open(encoding="utf-8") as fh:

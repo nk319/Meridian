@@ -24,8 +24,8 @@ import random
 import sys
 from pathlib import Path
 
+from . import anchors, defects, entities, tickets, writers
 from . import config as C
-from . import defects, entities, tickets, writers
 from .identity import PIIRegistry, make_customers
 
 
@@ -168,6 +168,12 @@ def main(argv: list[str] | None = None) -> int:
             "expected_versions": len(C.SCD2_DEMO_TRANSITIONS) + 1,
             "hard_deleted_customer_id": C.HARD_DELETE_CUSTOMER_ID,
         },
+        # Values eval/golden_questions.yml needs to name. Published rather than
+        # hardcoded there: the one question that discriminates between the
+        # lexical and vector rankers has to name an identifier occurring in
+        # exactly one ticket, and which identifier that is depends on what was
+        # generated. See meridian/seed/anchors.py.
+        "eval_anchors": anchors.derive(ticket_rows),
         "pii_term_counts": registry.as_manifest()["counts"],
         "defects_injected": len(defect_manifest),
     }

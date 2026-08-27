@@ -36,8 +36,11 @@ TICKET_INTENT = (
 TICKET_PRIORITY = ("P1", "P2", "P3", "P4")
 SENTIMENT = ("positive", "neutral", "negative")
 
-# Not in §9 — the source system's ticket lifecycle, recorded in CONTRACTS.md's
-# deviations table until Phase 4 promotes it.
+# In §9 since Phase 4. Both were enforced as CHECK constraints from Phase 1 and
+# lived in the deviations table until fact_support_tickets gave them a consumer.
+# TICKET_CHANNEL keeps its own name rather than joining `CHANNEL`: that one is
+# the marketing channel on orders and web events, and gold stages this one as
+# `contact_channel` so a `select *` cannot silently merge them.
 TICKET_STATUS = ("open", "pending", "resolved")
 TICKET_CHANNEL = ("email", "chat", "phone", "web_form")
 

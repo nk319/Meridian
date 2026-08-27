@@ -68,6 +68,15 @@ ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
 COPY pyproject.toml /opt/meridian/pyproject.toml
 COPY src /opt/meridian/src
 
+# The dbt project, alongside the pipeline rather than under /opt/airflow. Two
+# reasons, both about paths. `meridian.dbt.results` reads run_results.json from
+# `<project root>/dbt/target`, and the project root inside this image is
+# MERIDIAN_ROOT=/opt/meridian — so putting the project here means the parse task
+# needs no argument and cannot be pointed at a stale directory. And dbt writes
+# target/ and logs/ into the project directory, so it has to be somewhere the
+# airflow user can write, which a read-only bind mount of the repo would not be.
+COPY dbt /opt/meridian/dbt
+
 RUN python3 -m venv /opt/meridian-venv \
     && /opt/meridian-venv/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/meridian-venv/bin/pip install --no-cache-dir "/opt/meridian[rag]" pandera pandas

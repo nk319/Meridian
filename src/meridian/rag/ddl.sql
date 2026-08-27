@@ -198,3 +198,70 @@ CREATE TABLE IF NOT EXISTS rag.eval_results (
     retrieved        jsonb       NOT NULL,
     PRIMARY KEY (eval_run_id, strategy, question_id)
 );
+
+
+-- --------------------------------------------------------------------------
+-- The LLM's read on each ticket.
+--
+-- Lives in `rag` rather than `silver` because the vocabulary that produced it
+-- is a model, not a source system: silver is cleaned source data, and a
+-- prediction is neither. gold.fact_support_tickets joins it alongside the
+-- source system's own `intent` and `sentiment`, which db/init/05_oltp_ddl.sql
+-- marks as ground truth and never feeds to the model — so the fact table can
+-- carry both and the mart can report how often they agree.
+--
+-- The schema invariant holds: every column here is either an identifier
+-- already in `rag.chunks`, a label from a frozen CONTRACTS.md §9 vocabulary,
+-- or provenance. No free text, so nothing to mask.
+--
+-- Empty is a valid state. Without an ANTHROPIC_API_KEY there is no model to
+-- ask, `meridian.rag.enrich` writes nothing, and every ai_* column downstream
+-- is NULL — which docs/governance/owners.yml states as the contract for this
+-- table's consumers rather than something they discover.
+-- --------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS rag.ticket_enrichment (
+    ticket_id       text PRIMARY KEY,
+
+    predicted_intent text CHECK (predicted_intent IN (
+        'shipping_delay', 'refund_request', 'product_defect',
+        'billing_question', 'account_access', 'return_process',
+        'general_inquiry')),
+    predicted_sentiment text CHECK (predicted_sentiment IN (
+        'positive', 'neutral', 'negative')),
+
+    -- The model's own stated confidence, not a calibrated probability. Kept
+    -- because a low-confidence disagreement and a high-confidence one are
+    -- different events, and named so nobody mistakes it for the latter.
+    confidence      numeric CHECK (confidence IS NULL
+                                   OR (confidence >= 0 AND confidence <= 1)),
+
+    -- What the model was shown. The masked chunk text, hashed the same way
+    -- rag.chunks hashes it, so re-running after a masking change re-enriches
+    -- exactly the tickets whose input actually changed — the same skip-key
+    -- reasoning as the indexer, for the same reason.
+    content_hash    text        NOT NULL,
+    model           text        NOT NULL,
+    enriched_at     timestamptz NOT NULL DEFAULT now(),
+
+    -- Set when the model returned something outside the vocabulary or nothing
+    -- parseable. The row still exists, with null labels: "we asked and got
+    -- nothing usable" and "we never asked" are different states, and a missing
+    -- row cannot express the first.
+    error           text
+);
+
+COMMENT ON TABLE rag.ticket_enrichment IS
+    'LLM-predicted intent and sentiment per ticket. Scored against the source '
+    'system''s own labels in gold.mart_support_health. Empty without an API key.';
+
+CREATE INDEX IF NOT EXISTS ticket_enrichment_model_idx
+    ON rag.ticket_enrichment (model);
+
+
+-- Explicit grants for the tables above. ALTER DEFAULT PRIVILEGES in
+-- db/init/04_roles.sql covers tables created after it runs — which is all of
+-- these — but only for roles that existed when it ran. Stating them here means
+-- a database initialised before the dbt_runner grant was added still ends up
+-- correct on the next indexer run, rather than needing a manual repair.
+GRANT SELECT ON ALL TABLES IN SCHEMA rag TO analytics_ro;
+GRANT SELECT ON rag.ticket_enrichment TO dbt_runner;

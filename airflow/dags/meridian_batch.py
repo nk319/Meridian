@@ -26,10 +26,22 @@ from airflow.sdk import DAG, Asset
 
 PY = "/opt/meridian-venv/bin/python"
 
+# dbt lives in its own interpreter and is invoked by absolute path, never
+# imported. CONTRACTS.md §6 explains why this is forced rather than tidy:
+# Airflow 3.1.3's constraints pin protobuf 4.25.8 and dbt-core needs >=6, so the
+# image provably cannot build with them co-installed.
+DBT = "/opt/dbt-venv/bin/dbt"
+DBT_DIR = "/opt/meridian/dbt"
+
 # Consumed by meridian_rag. Data-aware scheduling rather than a cron guess:
 # the RAG index runs when the tickets it indexes have actually landed, not at a
 # time somebody hoped the batch would be finished by.
 SILVER_READY = Asset("meridian://silver/support_tickets")
+
+# Consumed by nothing yet — the dashboard is Phase 7. Declared now because the
+# outlet is what makes "gold is rebuilt" an event other DAGs can subscribe to,
+# and adding it later means editing this DAG to add a consumer elsewhere.
+GOLD_READY = Asset("meridian://gold/marts")
 
 DEFAULT_ARGS = {
     "owner": "data-platform",
@@ -104,4 +116,88 @@ with DAG(
         "the Pandera distribution schemas. Exit 2 on any BLOCK failure.",
     )
 
+    # ------------------------------------------------------------------
+    # dbt. Runs after data_quality, so a BLOCK failure in silver stops the
+    # transform rather than propagating bad numbers into gold with a green DAG
+    # above them.
+    # ------------------------------------------------------------------
+    def dbt_step(task_id: str, *args: str, **kwargs) -> BashOperator:
+        # `cd` into the project rather than passing --project-dir: dbt writes
+        # target/ relative to the project directory either way, and the parse
+        # step below reads it from a fixed path.
+        command = " ".join([f"cd {DBT_DIR} &&", DBT, *args, "--profiles-dir", DBT_DIR])
+        return BashOperator(task_id=task_id, bash_command=command, **kwargs)
+
+    dbt_snapshot = dbt_step(
+        "dbt_snapshot",
+        "snapshot",
+        doc_md=(
+            "SCD2 history for customers. Runs *before* the models, not after: "
+            "`dim_customer` reads the snapshot table, so a run in the other "
+            "order builds today's dimension from yesterday's history and the "
+            "dashboard is a day stale in a way nothing reports.\n\n"
+            "Idempotent — a second run on unchanged data adds no versions. The "
+            "one-time backfill that reconstructs history from the change log is "
+            "`scripts/dbt_snapshot_backfill.sh` and deliberately is not a task "
+            "here; it is not idempotent and must not run on a schedule."
+        ),
+    )
+
+    dbt_run = dbt_step(
+        "dbt_run",
+        "run",
+        doc_md=(
+            "gold_stg -> gold_int -> gold. Views for staging and intermediate, "
+            "tables for the dims, facts and marts the dashboard queries."
+        ),
+    )
+
+    dbt_test = dbt_step(
+        "dbt_test",
+        "test",
+        # The outlet hangs off the *test*, not off the parse step below it.
+        # `dbt_results` runs on all_done — it has to, or a failing test is the
+        # one result never recorded — so putting GOLD_READY there would fire
+        # the asset after a red test suite and wake every consumer to read a
+        # warehouse that just failed its own assertions.
+        outlets=[GOLD_READY],
+        doc_md=(
+            "87 assertions: grain, referential integrity, enum vocabularies, "
+            "and the four singular SCD2 tests CONTRACTS.md §8 requires. A "
+            "non-zero exit fails this task and stops the gold outlet from "
+            "firing, so a consumer scheduled on it does not read a warehouse "
+            "that just failed its own tests."
+        ),
+    )
+
+    dbt_results = step(
+        "dbt_results",
+        "meridian.dbt.results",
+        # The one task in the chain that must run even when the one before it
+        # failed: its entire job is to record what dbt found, and a failing
+        # `dbt test` is exactly when that record matters. Without this trigger
+        # rule the failures dbt caught would be the ones never written down.
+        trigger_rule="all_done",
+        doc_md=(
+            "Parse dbt's run_results.json into meta.dq_check_results with "
+            "source='dbt', so every assertion in the platform — Pandera, "
+            "custom SQL and dbt alike — is queryable from one table "
+            "(CONTRACTS.md §7)."
+        ),
+    )
+
+    enrich = step(
+        "rag_enrich",
+        "meridian.rag.enrich",
+        "--limit", "200",
+        doc_md=(
+            "Classify tickets from masked text and write rag.ticket_enrichment, "
+            "which fact_support_tickets joins and mart_support_health scores. "
+            "Exits 0 doing nothing when no ANTHROPIC_API_KEY is set — the "
+            "platform is specified to run end to end without one.\n\n"
+            "Before dbt, so a run's predictions reach the same run's marts."
+        ),
+    )
+
     bootstrap >> ingest >> build_silver >> load_warehouse >> data_quality
+    data_quality >> enrich >> dbt_snapshot >> dbt_run >> dbt_test >> dbt_results
