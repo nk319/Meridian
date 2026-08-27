@@ -102,6 +102,8 @@ make pipeline             # source system -> Bronze -> Silver -> warehouse -> DQ
 make rag-index            # chunk, mask, embed, upsert  (~3 min first run)
 make dbt-venv             # a second interpreter, for dbt only (see below)
 make gold                 # enrich -> snapshot backfill -> dbt run -> test -> record
+make stream-up            # Redpanda + the topics declared in contracts/topics.yml
+make stream-demo          # produce, consume with both groups, show lag and the DLQ
 make rag-eval             # measure recall@5 against the golden set
 make test                 # the full suite
 ```
@@ -275,6 +277,79 @@ matters.
 
 ---
 
+## Streaming
+
+Redpanda on the Kafka wire protocol, single node. `contracts/topics.yml` is the
+only place a topic is declared: `meridian.stream.admin --create` is the init
+script and reads that same file, and a test greps the package for a hardcoded
+topic name. The four-way drift between an init script, a producer, a consumer
+and a dashboard each holding their own copy of `ecom.web.events.v1` is what a
+manifest is for, and it only works if nothing bypasses it.
+
+```
+                      ecom.web.events.v1   (3 partitions, keyed by session_id)
+                                 │
+                 ┌───────────────┴───────────────┐
+                 ▼                               ▼
+        group: bronze-sink              group: realtime-metrics
+        Parquet -> bronze/stream/       event-time windows ->
+        commit AFTER the write          meta.stream_metrics
+                 │                               │
+                 └──────────► ecom.dlq.v1 ◄──────┘
+                        what neither could decode
+```
+
+**Two groups on one topic is the only concrete proof that group offsets are
+independent**, which is why there are two. They do genuinely different work: the
+sink cares about durability and writes every row, the metrics consumer cares
+about latency and writes one aggregate per window. `make stream-lag` shows both
+positions side by side.
+
+**Messages are Avro, with no Schema Registry.** The topic is the schema binding,
+via the manifest. Each message uses Avro single-object encoding — the `C3 01`
+marker, a CRC-64-AVRO fingerprint of the writer's schema, then the datum — so a
+consumer can *detect* a schema it was not expecting. That matters more than it
+sounds: Avro is a positional binary format, so decoding a message under the
+wrong schema does not error, it produces a record full of plausible nonsense.
+
+Every §9 vocabulary is an Avro `enum` rather than a string, so `add_to_kart`
+fails at the producer where the error names the field, instead of days later as
+a funnel step that never fires. Amounts are Avro `decimal`, not `double`.
+
+**A poison message must not stall a partition.** The naive failure is a consumer
+that raises, restarts, re-reads the same message from the uncommitted offset and
+raises again — forever, with the partition frozen and lag climbing. Bad messages
+go to `ecom.dlq.v1` with the topic/partition/offset coordinate and the original
+bytes, and the loop continues. `make stream-dlq` reads the queue without joining
+a consumer group, so looking at it neither consumes it nor pollutes the lag
+table.
+
+**The streaming path is a Bronze source, not a parallel architecture.** The sink
+writes under `source='stream'` into the same layout the batch ingestors use, and
+`build_silver` reads every source that carries an entity. The reconciliation is
+measurable:
+
+| | rows |
+| --- | ---: |
+| `bronze/files/web_events` | 156,877 |
+| `bronze/stream/web_events` | 414 |
+| Bronze read by `build_silver` | 157,291 |
+| **`silver.web_events`** | **153,136** |
+
+All 295 distinct streamed events were second captures of events the file drop
+already had, and the dedup on the natural key collapsed them. The Silver row
+count is unchanged by the streaming path existing — which is the Lambda shape
+reconciled in one place rather than two tables nobody dares join.
+
+`meta.stream_metrics` is deliberately **not** in `gold`. It holds what the
+stream believed at a point in time, from an at-least-once feed with no
+late-arrival handling; the marts hold what the batch path concluded after
+deduplication and quality gating. They disagree, and a dashboard that shows both
+is showing the actual latency/correctness tradeoff rather than asserting there
+isn't one.
+
+---
+
 ## Orchestration
 
 Airflow 3.1.3, `LocalExecutor`, pinned to the exact patch because the constraints
@@ -351,7 +426,9 @@ that happens to work, not a calibrated one.
 
 ```
 docker-compose.yml  `core` profile: Postgres (pgvector) + MinIO. `full` arrives later.
-contracts/          topic manifest — broker init and client constants generate from it
+contracts/
+  topics.yml        topic manifest — broker init and client constants generate from it
+  schemas/          the Avro schemas it references
 db/init/            01..05 SQL, run once on an empty data directory, in this order
 docs/
   CONTRACTS.md      the frozen interface between every component
@@ -396,6 +473,16 @@ src/meridian/
     evaluate.py     recall@5 with a chance baseline and per-strategy breakdown
   dbt/
     results.py      dbt run_results.json -> meta.dq_check_results, source='dbt'
+  stream/
+    topics.py       the manifest loader; the only place a topic is named
+    client.py       client config and Avro single-object framing
+    admin.py        create the declared topics; report drift against them
+    produce.py      replay seed rows onto the topics, optionally corrupted
+    consume.py      the shared loop: commit-after-work, per-partition, DLQ
+    sink_bronze.py  `bronze-sink` — Parquet into bronze/stream/
+    metrics.py      `realtime-metrics` — event-time windows into meta
+    lag.py          append to meta.kafka_consumer_offsets
+    dlq.py          read the dead letter queue without joining a group
 dbt/                the transform project, run from its own interpreter
   models/staging/   9 views — the only place that knows physical source names
   models/intermediate/  rollups, the session funnel, the point-in-time rebuild
@@ -426,7 +513,14 @@ A map of each concept to the file that demonstrates it lives in
 | Backfilling SCD2 history from a change log | `scripts/dbt_snapshot_backfill.sh`, `macros/snapshot_get_time.sql` |
 | PII classification and masking | `docs/governance/pii_classification.yml`, `seed/identity.py` |
 | Data quality by design | `seed/defects.py` — known-bad rows for the DQ suite to catch |
-| Kafka partitioning strategy | `contracts/topics.yml` |
+| Kafka partitioning strategy | `contracts/topics.yml`, `stream/topics.py` |
+| Topic config generated from one manifest | `stream/admin.py`, enforced by `tests/test_stream.py` |
+| Avro schemas without a Schema Registry | `contracts/schemas/`, `stream/client.py` |
+| Independent consumer group offsets | `stream/sink_bronze.py` vs. `stream/metrics.py` |
+| Manual offset commit after persistence | `stream/consume.py` — `_flush` |
+| Dead letter queue with a traceable coordinate | `stream/consume.py`, `stream/dlq.py` |
+| Consumer lag as a time series | `stream/lag.py`, `meta.kafka_consumer_offsets` |
+| Batch and stream reconciled in one Silver table | `lake/silver_spec.py` — `also_from` |
 | Least-privilege database roles | `db/init/04_roles.sql`, proven in `tests/test_rag_retrieval.py` |
 | Hybrid retrieval (BM25 + vector, RRF) | `src/meridian/rag/retrieve.py` |
 | BM25 implemented in SQL | `src/meridian/rag/ddl.sql`, `retrieve.py` |

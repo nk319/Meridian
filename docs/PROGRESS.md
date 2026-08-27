@@ -10,11 +10,11 @@ history, which does not survive a container restart.
 
 | | |
 | --- | --- |
-| **Phase** | 4 — dbt Gold star schema |
+| **Phase** | 5 — Redpanda streaming |
 | **Status** | ✅ Complete |
-| **Tag** | `phase-3` and `phase-4` — both need a human to push them, see below |
-| **Next phase** | 5 — Redpanda streaming |
-| **Next action** | Generate topics from `contracts/topics.yml`, build the producer, and run two independent consumer groups (`bronze-sink` with manual commit after persist, `realtime-metrics` with its own offsets) plus a DLQ, recording lag in `meta.kafka_consumer_offsets` (CONTRACTS.md §4). The table already exists; nothing writes to it yet. |
+| **Tag** | `phase-3`, `phase-4`, `phase-5` — all need a human to push them, see below |
+| **Next phase** | 6 — FastAPI service |
+| **Next action** | Build the FastAPI app: support-ticket endpoints writing to `oltp` as `meridian_app`, `/v1/ai/*` over the Phase 1 RAG layer reading as `analytics_ro`, JWT auth and a separate ingest key (CONTRACTS.md §5 and §13). `meridian.ingest.restapi` currently reads a JSON document — Phase 6 is when it reads the real service. |
 
 ### What this session can and cannot push
 
@@ -49,16 +49,17 @@ Practical consequences for a future session:
 
   ```bash
   git fetch origin
-  git push origin refs/tags/phase-3 refs/tags/phase-4
+  git push origin refs/tags/phase-3 refs/tags/phase-4 refs/tags/phase-5
   ```
 
-  Both tags already exist locally in this session's clone but cannot leave it.
+  All three tags already exist locally in this session's clone but cannot leave it.
   To recreate them from scratch in your own clone:
 
   ```bash
   git tag -a phase-3 bed3a3f -m "Phase 3: data quality suites and orchestration"
   git tag -a phase-4 4d849e6 -m "Phase 4: dbt Gold star schema"
-  git push origin refs/tags/phase-3 refs/tags/phase-4
+  git tag -a phase-5 1c0fce3 -m "Phase 5: Redpanda streaming"
+  git push origin refs/tags/phase-3 refs/tags/phase-4 refs/tags/phase-5
   ```
 
 The branch `claude/phase-1-setup-8lokjp` carries every phase. (The name is Phase
@@ -345,6 +346,91 @@ exact, the fix is a direct `ticket_id`/`order_id` lookup path, not a tuned `k`.*
   `ANTHROPIC_API_KEY` is configured here. The join, the agreement flags and the
   null-safe accuracy denominators are all exercised; only the model call is not.
   Setting a key and running `make rag-enrich` populates it with no code change.
+
+---
+
+## Phase 5 — complete
+
+**Goal:** Redpanda on the Kafka wire protocol, with the topics, producer, two
+independent consumer groups and DLQ CONTRACTS.md §4 specifies.
+
+### Delivered
+
+| Artifact | What it does |
+| --- | --- |
+| `contracts/schemas/*.avsc` | Three Avro schemas the manifest already pointed at but which did not exist |
+| `src/meridian/stream/topics.py` | The one manifest loader. Nothing else may name a topic |
+| `src/meridian/stream/client.py` | Client config and Avro single-object framing, in one place |
+| `src/meridian/stream/admin.py` | `--create` (the init script) and `--describe` (drift against the manifest) |
+| `src/meridian/stream/produce.py` | Replays seed rows onto the topics; `--defects` feeds the DLQ |
+| `src/meridian/stream/consume.py` | The shared loop: commit-after-work, per-partition commits, dead lettering |
+| `src/meridian/stream/sink_bronze.py` | `bronze-sink` — Parquet into `bronze/stream/`, committing after the write |
+| `src/meridian/stream/metrics.py` | `realtime-metrics` — event-time windows into `meta.stream_metrics` |
+| `src/meridian/stream/lag.py` | Appends to `meta.kafka_consumer_offsets`; `--max-lag` exits 2 |
+| `src/meridian/stream/dlq.py` | Reads the DLQ without joining a group |
+| `airflow/dags/meridian_stream_ops.py` | Every 15 min: ensure topics, check drift, record lag |
+| `tests/test_stream.py` | 16 tests; the broker-backed ones skip without Redpanda |
+
+### Acceptance — met
+
+```
+226 pytest                     # stack up, broker up, no ANTHROPIC_API_KEY
+ruff check + ruff format       # clean
+lag drains to 0 on all 3 partitions, for both groups
+```
+
+`make stream-demo` produces 3,000 events with 2% corruption, runs both groups
+to completion, and shows lag before and after alongside the dead letters. All
+four failure kinds reach the DLQ: not-Avro, truncated, valid-under-another-
+schema, and the seed's own injected defects (month 13, empty enums).
+
+### The batch/stream reconciliation, measured
+
+| | rows |
+| --- | ---: |
+| `bronze/files/web_events` | 156,877 |
+| `bronze/stream/web_events` | 414 |
+| Bronze read by `build_silver` | 157,291 |
+| **`silver.web_events`** | **153,136** |
+
+All 295 distinct streamed `event_id`s were second captures of events the file
+drop already had, and the natural-key dedup collapsed them — the Silver row
+count is unchanged by the streaming path existing. That is the Lambda shape
+reconciled in one place, rather than two tables that disagree.
+
+### Decisions taken
+
+| Decision | Reasoning |
+| --- | --- |
+| The init script is Python, not shell | A shell script running `rpk topic create` is a second place the partition counts live, which is exactly what §4's manifest exists to prevent. A test greps the package for a hardcoded topic name. |
+| Avro **single-object encoding**, no registry | There is no Schema Registry here, so the topic is the schema binding. The `C3 01` marker plus a CRC-64-AVRO fingerprint is what lets a consumer *detect* a schema it was not expecting — Avro is positional, so a wrong schema does not error, it produces plausible nonsense. |
+| Enums in the schema, not strings | `add_to_kart` is accepted by a string field and surfaces days later as a funnel step that never fires. An enum rejects it at the producer, where the error names the field. |
+| `decimal` for amounts, not `double` | A float amount is a rounding error waiting for a SUM. Same DECIMAL(12,2) the warehouse stores. |
+| `enable.auto.commit = False`, in `client.py` | It defaults to *true*, and a consumer that auto-commits has acknowledged messages it may still drop. Set once in the shared config so the next consumer cannot omit it. |
+| A poison message is dead-lettered, not raised | Raising restarts the consumer, which re-reads the same message from the uncommitted offset and raises again — forever, with the partition frozen. The DLQ envelope carries topic/partition/offset because a dead letter you cannot trace back is a log line. |
+| The DLQ reader joins no group | Reading the queue must not consume it, and a diagnostic tool that joined a group would appear in the lag table it exists to help interpret. |
+| Streaming is a Bronze **source**, not a parallel path | `layout.py` always listed `stream` among the five source systems. One Silver builder, one dedup, one DQ suite. |
+| `meta.stream_metrics` is not in `gold` | These are what the stream believed from an at-least-once feed; the marts are what batch concluded after dedup. Keeping them apart is what lets a dashboard show the tradeoff instead of asserting there isn't one. |
+| Lag is recorded on a **schedule** | A single reading cannot tell a dead consumer from a slow one — one climbs without bound, the other plateaus. Only a series distinguishes them, which is why `observed_at` is in the primary key. |
+
+### Bugs found and fixed
+
+| Bug | How it surfaced |
+| --- | --- |
+| **A batch committed only one partition.** `commit(message=batch[-1])` commits that message's partition; a poll loop is fed from all three. | No data was lost — the uncommitted messages are simply re-delivered — but the group never advanced on the other partitions, so lag would climb without bound while the consumer reported success. Found because `meta.kafka_consumer_offsets` recorded partition 0 as "never committed" after a run that had plainly consumed it. Now commits `max(offset) + 1` per partition in the batch. |
+| **The metrics upsert replaced instead of adding.** | Offsets guarantee a second run sees only what the first did not, so its in-memory counter starts at zero — and `value = EXCLUDED.value` discards everything already counted. Visible as `events_by_type` summing to 2,892 against `events` at 2,884 over the same messages, the difference being (window, dimension) pairs the first run wrote and the second never touched. Now persists deltas against an additive upsert. |
+| **The producer crashed on the seed's own defects.** | `seed/defects.py` injects unparseable timestamps and empty enums, and the reader converted as it read. Those rows are not a problem to route around — they are the most realistic messages this producer can send, so they now go on the wire as raw JSON and the consumers dead-letter them. |
+| **`fastavro`'s logical types are asymmetric.** `timestamp-millis` accepts an int and returns a `datetime`. | The DLQ reader divided a `datetime` by 1000. Lossless and correct on both sides; the trap is assuming the type you wrote is the type you read. |
+
+### Known and stated, not fixed
+
+**At-least-once means `meta.stream_metrics` can double-count.** A crash between
+writing a window's delta and committing the offset re-delivers those messages.
+The Bronze sink has the identical exposure and Silver's record hash removes it
+downstream; a counter has no such recourse. Exactly-once would need the offset
+committed in the same Postgres transaction as the metric — a transactional
+outbox keyed on the offset, which is a real design and a much larger one than a
+demonstration of consumer-group semantics warrants.
 
 ---
 
