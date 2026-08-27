@@ -61,7 +61,7 @@ Practical consequences for a future session:
   git tag -a phase-5 1c0fce3 -m "Phase 5: Redpanda streaming"
   git tag -a phase-6 92c3429 -m "Phase 6: FastAPI service"
   git tag -a phase-7 7148694 -m "Phase 7: Streamlit dashboard"
-  git tag -a phase-8 <sha of "Phase 8: CONCEPTS.md"> -m "Phase 8: docs and final verification"
+  git tag -a phase-8 558c0d8 -m "Phase 8: docs and final verification"
   git push origin --tags
   ```
 
