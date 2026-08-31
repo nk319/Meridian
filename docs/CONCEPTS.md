@@ -15,14 +15,14 @@ grains, because header-only makes `dim_product` unjoinable and line-only forces
 `count(distinct order_id)` into every revenue query" is. The second column of
 each table is where that lives.
 
-Total: **272 tests**, **12,602 lines** of Python across `src/` and `dashboard/`,
+Total: **274 tests**, **12,634 lines** of Python across `src/` and `dashboard/`,
 plus 29 dbt models, 6 singular dbt tests and 38 data quality checks.
 
 Each of those is a command, not a claim — §14's thirteenth row is what happens
 when it is the other way round:
 
 ```bash
-pytest --collect-only            # 272 tests collected
+pytest --collect-only            # 274 tests collected
 find src dashboard -name '*.py' -not -path '*/__pycache__/*' | xargs wc -l
 cd dbt && dbt ls                 # Found 29 models, 1 snapshot, 87 data tests
                                  # `dbt run` reports PASS=28: one model is

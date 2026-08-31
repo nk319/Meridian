@@ -7,7 +7,7 @@ support history.
 
 > **Complete — all eight phases.** Verified from a destroyed-and-rebuilt
 > database in five minutes: `make verify-cold` runs lint, the full batch
-> pipeline, 38 data quality checks, 29 dbt models, 87 dbt tests, 272 pytest
+> pipeline, 38 data quality checks, 29 dbt models, 87 dbt tests, 274 pytest
 > tests and the retrieval evaluation, and every one of them passes.
 >
 > Every push runs [CI](.github/workflows/ci.yml): one job with no Docker, one
@@ -15,8 +15,9 @@ support history.
 >
 > [`docs/CONCEPTS.md`](docs/CONCEPTS.md) maps each concept to the file that
 > demonstrates it — including a section on the fourteen bugs this project shipped
-> and then found, every one of which had no symptom. The last two were found by
-> CI, on its first two runs.
+> and then found, every one of which had no symptom. Two were found by CI on its
+> first two runs, and the last two while demonstrating the finished project —
+> the first time anything ran it the way a stranger would.
 > [`docs/CONTRACTS.md`](docs/CONTRACTS.md) is the frozen interface between
 > components, with 21 recorded deviations.
 > [`docs/PROGRESS.md`](docs/PROGRESS.md) is the per-phase record.
@@ -105,7 +106,7 @@ Full reasoning, and every other cross-component decision, is in
 ## Quickstart
 
 ```bash
-cp .env.example .env      # then set the passwords; nothing has a default
+make env                  # .env with 13 generated secrets; refuses to clobber
 make venv                 # .venv with the rag and dev extras
 make seed                 # generate all source data (deterministic, ~15s)
 make up                   # Postgres (pgvector) + MinIO, waits for health
@@ -728,7 +729,7 @@ The last cold run, in five minutes:
 | `ruff check` + `ruff format --check` | clean, 83 files |
 | Data quality | **38 checks**, 0 failed, 0 blocking |
 | dbt | **29 models** — 28 built, 1 ephemeral — **87 tests**, 0 errors |
-| pytest | **272 passed** |
+| pytest | **274 passed** |
 | Retrieval | recall@5 **1.00** hybrid / 1.00 lexical / 0.91 vector; abstention 1.00 |
 | Streaming | 3,000 produced, 2,884 consumed per group, 116 dead-lettered, lag drains to **0** on all 3 partitions |
 | API | **17/17** endpoint steps, over the network |

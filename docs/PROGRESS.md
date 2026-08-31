@@ -668,8 +668,8 @@ are not vacuous, and the reproduction query on every quality finding.
 | 7 | The Streamlit dashboard, cached on the pipeline watermark | `phase-7` |
 | 8 | `CONCEPTS.md` and cold verification | `phase-8` |
 
-**12,602 lines** of Python across `src/` and `dashboard/`, 29 dbt models,
-6 singular dbt tests, 38 data quality checks, 272 pytest tests, 3 Airflow DAGs,
+**12,634 lines** of Python across `src/` and `dashboard/`, 29 dbt models,
+6 singular dbt tests, 38 data quality checks, 274 pytest tests, 3 Airflow DAGs,
 5 source systems, 7 warehouse schemas and 6 database roles.
 
 ---
