@@ -45,9 +45,24 @@ def loaded(etl):
 
 @pytest.fixture(scope="module")
 def duck():
+    """A DuckDB connection wired to MinIO, or a skip.
+
+    Guarded, and the ordering is why it has to be. A test signature like
+    `(duck, etl, loaded)` has pytest build `duck` first, so an unguarded
+    fixture raises before `etl`'s `server_reachable()` skip can fire — the two
+    tests using it were the only ones in the suite that *errored* rather than
+    skipping on a machine with no `.env`.
+
+    `RuntimeError` rather than a connection error: `meridian.lake.duck` refuses
+    to build a connection when the MinIO credentials are absent, which happens
+    before anything reaches the network.
+    """
     from meridian.lake.duck import connect
 
-    return connect()
+    try:
+        return connect()
+    except RuntimeError as exc:
+        pytest.skip(f"lake not configured — copy .env.example to .env ({exc})")
 
 
 # ---------------------------------------------------------------------------

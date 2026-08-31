@@ -100,6 +100,19 @@ def _query(sql: str, params: tuple = ()) -> pd.DataFrame:
             columns = [d.name for d in cur.description]
     except UpstreamUnavailable as exc:
         raise WarehouseUnavailable(str(exc)) from exc
+    except RuntimeError as exc:
+        # Raised by `settings.dsn()` when the role's password is not configured
+        # at all — a different failure from the server being down, and it
+        # happens *before* any connection is attempted, so `server_reachable()`
+        # never gets a chance to report it.
+        #
+        # Both mean the same thing to a caller: there is no warehouse here. On
+        # a fresh clone with no `.env`, or a CI runner that deliberately has
+        # none, the unmapped version propagated and turned six dashboard tests
+        # from skips into failures.
+        if "not set" not in str(exc):
+            raise
+        raise WarehouseUnavailable(f"not configured: {exc}") from exc
     except Exception as exc:  # noqa: BLE001
         message = str(exc)
         if "does not exist" in message:
