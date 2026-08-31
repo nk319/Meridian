@@ -142,9 +142,8 @@ def test_declared_dependencies_cover_what_the_pipeline_imports(pyproject):
         if not any(_normalise(candidate) in declared for candidate in candidates):
             undeclared[module] = sorted(importers)[:3]
 
-    assert not undeclared, (
-        "imported by src/ but declared in no dependency group: "
-        + "; ".join(f"{name} (from {', '.join(files)})" for name, files in undeclared.items())
+    assert not undeclared, "imported by src/ but declared in no dependency group: " + "; ".join(
+        f"{name} (from {', '.join(files)})" for name, files in undeclared.items()
     )
 
 

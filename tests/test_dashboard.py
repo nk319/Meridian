@@ -153,14 +153,28 @@ def test_the_funnel_never_widens():
 def test_the_watermark_comes_from_completed_runs_only():
     """A run still in flight has a null `completed_at`, so it cannot advance the
     watermark — which is what stops a half-finished load presenting itself as
-    fresh data."""
+    fresh data.
+
+    Two halves, and only the second needs a database. The split matters: the
+    source assertions are the ones that would catch somebody deleting the
+    `IS NOT NULL`, and they are worth running in CI where there is no Postgres.
+
+    The database half is guarded rather than assumed. It was not, and this was
+    the one test in the suite that *failed* rather than skipping without a
+    stack — which the repository claims none of them do, and which would have
+    broken the no-Docker CI job on its first run.
+    """
     from dashboard import metrics
 
     source = (DASHBOARD / "metrics.py").read_text(encoding="utf-8")
     assert "completed_at IS NOT NULL" in source
     assert "meta.pipeline_run_log" in source
 
-    mark = metrics.watermark()
+    try:
+        mark = metrics.watermark()
+    except metrics.WarehouseUnavailable as exc:
+        pytest.skip(f"Postgres not reachable — run `make up` ({exc})")
+
     if mark.available:
         assert mark.completed_at.tzinfo is not None, "a naive watermark cannot be compared to now()"
 
