@@ -1,0 +1,172 @@
+# Continuous integration.
+#
+# Two jobs, split by what they need rather than by what they check.
+#
+# `checks` needs nothing but the repository, so it runs in about a minute and
+# is the one that gates a pull request. `stack` stands up Postgres and MinIO and
+# runs the platform end to end, which takes longer and is the only thing that
+# exercises db/init/*.sql — Postgres executes those solely on an empty data
+# directory, so a broken init script survives every other check here.
+#
+# The DB-backed tests skip cleanly without a stack (tests/conftest.py), which is
+# what makes that split possible: `checks` runs the whole suite and reports the
+# ~100 tests that need no Docker, rather than running a hand-maintained subset
+# that drifts from the real one.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # One run per ref. A force-push or a quick second commit cancels the older
+  # run rather than queueing behind it, which matters because `stack` is slow.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  checks:
+    name: lint and stack-free tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install
+        # Every extra, because the tests import from all of them. `dashboard`
+        # brings Playwright's Python package but not a browser — the screenshot
+        # run is not part of CI, and importing it does not need one.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[rag,stream,api,dashboard,dev]"
+
+      - name: Lint
+        run: |
+          ruff check src tests dashboard
+          ruff format --check src tests dashboard
+
+      - name: Generate seed data
+        # Not optional: a dozen tests assert properties of the generated corpus,
+        # and `seeds/` is gitignored. Deterministic, so this is the same data
+        # every run.
+        run: make seed
+
+      - name: Tests
+        # The DB-backed ones skip. `-ra` prints the skip reasons, so the log
+        # says which tests did not run and why rather than reporting a count.
+        run: python -m pytest -ra
+
+  stack:
+    name: full stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[rag,stream,api,dev]"
+
+      - name: Install dbt in its own interpreter
+        # Separate, exactly as the Airflow image and `make dbt-venv` do it:
+        # Airflow pins protobuf 4.x and dbt-core requires 6.x. Co-installing is
+        # an unresolvable resolver error, so CI must not paper over it.
+        run: make dbt-venv
+
+      - name: Cache the embedding model
+        # fastembed downloads ~67 MB of ONNX on first use. Cached on the model
+        # name, which is pinned in .env, so a model change busts it correctly.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fastembed
+          key: fastembed-BAAI-bge-small-en-v1.5
+
+      - name: Write .env, and export it
+        # Real random secrets rather than the template's placeholders. Not
+        # theatre on a throwaway runner: db/init/04_roles.sql aborts on an unset
+        # password, and API_JWT_SECRET under 32 bytes makes PyJWT warn — so
+        # generating them here keeps CI honest about both rather than testing a
+        # configuration nobody would run.
+        #
+        # Also exported into $GITHUB_ENV. Three separate things would otherwise
+        # auto-load `.env` on their own — `meridian.settings`, docker compose,
+        # and dbt — and all three do work. But CI depending on three
+        # undocumented auto-load behaviours agreeing is a failure that would be
+        # very hard to read; exporting once makes the environment the single
+        # source, which is what `load_dotenv` prefers anyway (a real variable
+        # beats the file).
+        run: |
+          cp .env.example .env
+          gen() { openssl rand -base64 32 | tr -d '/+=' | head -c 32; }
+          {
+            echo "POSTGRES_SUPERUSER_PASSWORD=$(gen)"
+            echo "MERIDIAN_APP_PASSWORD=$(gen)"
+            echo "MERIDIAN_ETL_PASSWORD=$(gen)"
+            echo "DBT_RUNNER_PASSWORD=$(gen)"
+            echo "ANALYTICS_RO_PASSWORD=$(gen)"
+            echo "AIRFLOW_DB_PASSWORD=$(gen)"
+            echo "RAG_INDEXER_PASSWORD=$(gen)"
+            echo "MINIO_ROOT_PASSWORD=$(gen)"
+            echo "API_JWT_SECRET=$(gen)"
+            echo "API_INGEST_KEY=$(gen)"
+            echo "API_DEMO_PASSWORD=$(gen)"
+            echo "AIRFLOW_JWT_SECRET=$(gen)"
+            echo "AIRFLOW_FERNET_KEY=$(python -c 'import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
+          } >> .env
+          # Only well-formed KEY=VALUE lines, last-wins, so the overrides above
+          # beat the template values they duplicate.
+          grep -E '^[A-Z][A-Z0-9_]*=' .env | tac | sort -u -t= -k1,1 >> "$GITHUB_ENV"
+
+      - name: Seed and start the core profile
+        run: |
+          make seed
+          make up
+
+      - name: Batch pipeline
+        # bootstrap -> load-oltp -> ingest -> silver -> load-warehouse -> dq.
+        # Exits 2 if any BLOCK-severity quality check fails, which fails the job.
+        run: make pipeline
+
+      - name: Index the ticket corpus
+        run: make rag-index
+
+      - name: Gold layer
+        # rag-enrich (a no-op without an API key), the SCD2 backfill, dbt run,
+        # dbt test, and the run_results.json parse into meta.dq_check_results.
+        run: make gold
+
+      - name: Streaming
+        run: |
+          make stream-up
+          make stream-demo
+
+      - name: Full test suite
+        # Everything, with the stack up: nothing should skip except the tests
+        # that need an ANTHROPIC_API_KEY.
+        run: python -m pytest -ra
+
+      - name: Retrieval evaluation
+        # Exits 2 below recall@5 of 0.80, so a retrieval regression fails CI
+        # rather than being noticed at the next demo.
+        run: make rag-eval
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose --profile core --profile stream logs --tail 200
