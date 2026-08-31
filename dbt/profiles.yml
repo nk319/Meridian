@@ -1,0 +1,20 @@
+# Credentials come from the environment, never from this file.
+#
+# dbt connects as `dbt_runner`, which owns gold_stg/gold_int/gold and can read
+# silver — and holds nothing on `secure`, `oltp` or `meta`. That is the whole
+# point of a per-component role: a bug in a model cannot reach PII, because the
+# session it runs in has no grant on it.
+meridian:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST', 'localhost') }}"
+      port: "{{ env_var('POSTGRES_PORT', '5432') | int }}"
+      user: dbt_runner
+      password: "{{ env_var('DBT_RUNNER_PASSWORD') }}"
+      dbname: warehouse
+      schema: gold
+      threads: 4
+      keepalives_idle: 0
+      connect_timeout: 10

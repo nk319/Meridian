@@ -1,0 +1,447 @@
+# Meridian local stack.
+#
+# Profiles keep the footprint honest, and bringing one up must never require
+# standing up another.
+#
+#   core       Postgres (pgvector) + MinIO. ~700 MB. Everything the batch
+#              pipeline, the lake, the warehouse and the AI layer need.
+#   stream     Redpanda + its console.
+#   api        The FastAPI service.
+#   dashboard  Streamlit.
+#   full       All of the above plus the four Airflow containers. ~6.5 GB.
+#
+#   docker compose --profile core up -d
+#
+# `core` is what `make up` starts, and it is enough for `make pipeline`,
+# `make gold`, `make rag-index` and the whole test suite bar the streaming
+# tests, which skip cleanly without a broker.
+#
+# Every value comes from .env (copy .env.example). Nothing here carries a
+# default credential: an unset password fails the init scripts loudly rather
+# than silently creating a role with a blank password.
+
+name: meridian
+
+services:
+  # --------------------------------------------------------------------------
+  # Postgres. pgvector/pgvector:pg16, NOT postgres:16-alpine.
+  #
+  # CONTRACTS.md §1: the alpine image has no pgvector, and the failure surfaces
+  # much later as a confusing "type vector does not exist" from the indexer
+  # rather than at startup. The healthcheck below asserts the extension is
+  # actually present, so a wrong image fails here instead of in Phase 1 code.
+  # --------------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    profiles: [core, full]
+    container_name: meridian-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:?set POSTGRES_SUPERUSER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in .env}
+      POSTGRES_DB: postgres
+      # Read by db/init/04_roles.sql through psql's \getenv, so role passwords
+      # are never written into a file in this repo.
+      MERIDIAN_APP_PASSWORD: ${MERIDIAN_APP_PASSWORD:?set MERIDIAN_APP_PASSWORD in .env}
+      MERIDIAN_ETL_PASSWORD: ${MERIDIAN_ETL_PASSWORD:?set MERIDIAN_ETL_PASSWORD in .env}
+      DBT_RUNNER_PASSWORD: ${DBT_RUNNER_PASSWORD:?set DBT_RUNNER_PASSWORD in .env}
+      ANALYTICS_RO_PASSWORD: ${ANALYTICS_RO_PASSWORD:?set ANALYTICS_RO_PASSWORD in .env}
+      RAG_INDEXER_PASSWORD: ${RAG_INDEXER_PASSWORD:?set RAG_INDEXER_PASSWORD in .env}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD in .env}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # Postgres runs these once, in filename order, on an empty data directory.
+      # It aborts the whole startup on any error, which is why the ordering in
+      # CONTRACTS.md §1 is create-before-grant rather than a convention.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # Three assertions, and each one is load-bearing.
+      #
+      # pg_isready alone goes green as soon as the socket accepts connections.
+      # During initdb the entrypoint runs a temporary server on the unix socket,
+      # so a socket-only check reports healthy while 03..05 are still running —
+      # and anything with `depends_on: service_healthy` then starts against a
+      # half-built database. Asserting the LAST object the init sequence creates
+      # (oltp.support_tickets, from 05) closes that window.
+      #
+      # pg_extension proves this image really is pgvector/pgvector:pg16 rather
+      # than a plain postgres that would break the RAG layer much later.
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U "$${POSTGRES_USER}" -d warehouse -q &&
+          psql -U "$${POSTGRES_USER}" -d warehouse -tAc
+          "select 1 from pg_extension where extname = 'vector'" | grep -q 1 &&
+          psql -U "$${POSTGRES_USER}" -d oltp -tAc
+          "select 1 where to_regclass('public.support_tickets') is not null" | grep -q 1
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 20s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # MinIO — the object store standing in for S3. Phase 1 does not read from it;
+  # it is here because the bucket layout in CONTRACTS.md §2 is a frozen
+  # interface and Phase 2 should find it already correct.
+  # --------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    profiles: [core, full]
+    container_name: meridian-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # One-shot: create the lake bucket. Exits 0 and stays exited — `docker compose
+  # ps` showing it as Exited(0) is success, not a failure.
+  # --------------------------------------------------------------------------
+  minio-init:
+    image: minio/mc:latest
+    profiles: [core, full]
+    container_name: meridian-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      LAKE_BUCKET: ${LAKE_BUCKET:-meridian-lake}
+    entrypoint: >-
+      /bin/sh -c "
+      mc alias set local http://minio:9000 \"$${MINIO_ROOT_USER}\" \"$${MINIO_ROOT_PASSWORD}\" &&
+      mc mb --ignore-existing \"local/$${LAKE_BUCKET}\" &&
+      mc ls local &&
+      echo 'lake bucket ready'
+      "
+    restart: "no"
+
+  # --------------------------------------------------------------------------
+  # The dashboard. CONTRACTS.md §7 and §8.
+  #
+  # Reuses the Airflow image for the same reason the API does — it already
+  # carries the pipeline, and a second multi-gigabyte image differing only in
+  # its entrypoint buys nothing. The dashboard's own dependencies (streamlit,
+  # plotly) are installed into that image's pipeline venv.
+  #
+  # `dashboard/` is bind-mounted rather than baked. It is the one component
+  # somebody demonstrating this will want to edit and reload without a rebuild,
+  # and it holds no secrets — the connection is opened by `meridian.db` from the
+  # environment below.
+  # --------------------------------------------------------------------------
+  dashboard:
+    image: meridian-airflow:3.1.3
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    profiles: [dashboard, full]
+    container_name: meridian-dashboard
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MERIDIAN_ROOT: /opt/meridian
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      # `analytics_ro` and nothing else. The dashboard cannot be handed a role
+      # it should not use if the password for one is never in its environment —
+      # CONTRACTS.md §1's boundary, enforced by omission as well as by grant.
+      ANALYTICS_RO_PASSWORD: ${ANALYTICS_RO_PASSWORD}
+    command: >-
+      /opt/meridian-venv/bin/python -m streamlit run /opt/meridian/dashboard/app.py
+      --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    volumes:
+      - ./dashboard:/opt/meridian/dashboard:ro
+    ports:
+      - "${DASHBOARD_PORT:-8501}:8501"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # The platform's own API. CONTRACTS.md §1 and §5.
+  #
+  # Reuses the Airflow image rather than building a second one. That image
+  # already carries the pipeline in /opt/meridian-venv with the `rag` and
+  # `stream` extras, and a separate 4 GB image differing only in its entrypoint
+  # would double the build for nothing. The API runs from the same interpreter
+  # every Airflow task shells out to, which is also the honest arrangement: they
+  # are the same codebase.
+  #
+  # An `api` profile as well as `full`, so the service can be run without
+  # standing up a broker and four Airflow containers alongside it.
+  # --------------------------------------------------------------------------
+  api:
+    image: meridian-airflow:3.1.3
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    profiles: [api, full]
+    container_name: meridian-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MERIDIAN_ROOT: /opt/meridian
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      MERIDIAN_APP_PASSWORD: ${MERIDIAN_APP_PASSWORD}
+      ANALYTICS_RO_PASSWORD: ${ANALYTICS_RO_PASSWORD}
+      API_JWT_SECRET: ${API_JWT_SECRET:?set API_JWT_SECRET in .env}
+      API_JWT_EXPIRY_MINUTES: ${API_JWT_EXPIRY_MINUTES:-60}
+      API_INGEST_KEY: ${API_INGEST_KEY:?set API_INGEST_KEY in .env}
+      # No default. api/routers/auth.py returns 503 rather than accepting a
+      # credential committed to a repository.
+      API_DEMO_PASSWORD: ${API_DEMO_PASSWORD:-}
+      API_DEMO_USERS: ${API_DEMO_USERS:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
+      RAG_ABSTAIN_SIMILARITY: ${RAG_ABSTAIN_SIMILARITY:-0.68}
+    command: >-
+      /opt/meridian-venv/bin/python -m uvicorn meridian.api.main:app
+      --host 0.0.0.0 --port 8000
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      # /health, not /ready. Liveness must not fail because the vector store is
+      # empty — a restart does not index a corpus, so a readiness condition in a
+      # liveness probe is a restart loop.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 90s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Redpanda — Kafka wire protocol, single node. CONTRACTS.md §4.
+  #
+  # The flags are not optional and the first one is not cosmetic. Redpanda is
+  # built on Seastar, which by default assumes it owns the machine and
+  # busy-polls its reactor — on a laptop or a CI box that pins a full core at
+  # 100% forever, with an idle broker. `--overprovisioned` switches it to a
+  # polite polling mode. `--smp 1` and the memory flags keep it to one core and
+  # 1 GB rather than reserving most of the host.
+  #
+  # `--check=false` skips the production readiness checks (fs type, clock
+  # source, aio limits) that fail inside Docker on a developer machine and are
+  # correct to fail there.
+  #
+  # A `stream` profile as well as `full`, so streaming can be exercised without
+  # standing up four Airflow containers alongside it.
+  # --------------------------------------------------------------------------
+  redpanda:
+    image: redpandadata/redpanda:v24.3.6
+    profiles: [stream, full]
+    container_name: meridian-redpanda
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --check=false
+      - --node-id=0
+      # Two listeners, and both are needed. Clients inside the compose network
+      # resolve `redpanda:9092`; clients on the host resolve `localhost:19092`.
+      # A broker advertises the address it wants clients to reconnect on after
+      # metadata discovery, so a single listener works for exactly one of those
+      # two and fails the other with a name-resolution error that looks like the
+      # broker is down.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "${KAFKA_EXTERNAL_PORT:-19092}:19092"
+      - "${REDPANDA_ADMIN_PORT:-9644}:9644"
+    healthcheck:
+      # `cluster health` rather than a port check: the port accepts connections
+      # before the cluster has elected a controller leader, so a TCP probe goes
+      # green while `create_topics` still fails.
+      test: ["CMD-SHELL", "rpk cluster health -X brokers=localhost:9092 | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Redpanda Console — a browser view of topics, groups and lag.
+  #
+  # Not required by anything. It is here because "consumer group offsets are
+  # independent" is a claim, and watching two groups sit at different offsets on
+  # the same topic is the demonstration.
+  # --------------------------------------------------------------------------
+  redpanda-console:
+    image: redpandadata/console:v2.8.2
+    profiles: [stream, full]
+    container_name: meridian-redpanda-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "${REDPANDA_CONSOLE_PORT:-8090}:8080"
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Airflow 3.1.3, LocalExecutor. CONTRACTS.md §6.
+  #
+  # Pinned to the exact patch, because Airflow's constraints branch is named per
+  # patch — `constraints-3.1.x` does not exist, so "3.1" is not a thing you can
+  # install reproducibly.
+  #
+  # LocalExecutor: no Celery, no Redis, no worker fleet. The DAGs here fan out to
+  # at most five tasks and every one of them is a subprocess that shells out to
+  # another interpreter, so a distributed executor would add three moving parts
+  # to schedule work that a thread pool already handles.
+  #
+  # Airflow 3 splits what Airflow 2 called the webserver into an api-server, a
+  # scheduler and a dag-processor. They are separate services here rather than
+  # one container running three things, so a DAG parsing error cannot take the
+  # scheduler down with it.
+  # --------------------------------------------------------------------------
+  airflow-init:
+    <<: &airflow-common
+      image: meridian-airflow:3.1.3
+      build:
+        context: .
+        dockerfile: airflow/Dockerfile
+      profiles: [full]
+      depends_on:
+        postgres:
+          condition: service_healthy
+      environment: &airflow-env
+        AIRFLOW__CORE__EXECUTOR: LocalExecutor
+        AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+        AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+        AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set AIRFLOW_FERNET_KEY in .env}
+        AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+          postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@postgres:5432/airflow
+        AIRFLOW__API__SECRET_KEY: ${AIRFLOW_JWT_SECRET:?set AIRFLOW_JWT_SECRET in .env}
+        AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+        # Local development only. Everyone who can reach the port is an admin,
+        # which is acceptable for a stack bound to localhost and would not be
+        # anywhere else.
+        AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+        # Airflow 3 runs tasks through a Task Execution API rather than letting
+        # them touch the metadata database directly. The worker resolves that
+        # API from this setting, which defaults to localhost:8080 — correct for
+        # an all-in-one host, wrong for every split deployment including this
+        # one, where the api-server is a different container. Left unset, tasks
+        # queue, retry, and fail with `httpx.ConnectError: Connection refused`
+        # from inside the executor, which reads as a scheduler problem rather
+        # than a URL.
+        AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+        # DAG code is trusted here and parsing it is not a sandbox boundary.
+        AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
+
+        # --- what the pipeline subprocesses read ---------------------------
+        # The package lives in /opt/meridian-venv with no pyproject.toml above
+        # it, so the usual walk-up cannot find the project root. Without this
+        # every seeds/ and eval/ path resolves inside site-packages and the
+        # failure is an empty result rather than an error.
+        MERIDIAN_ROOT: /opt/meridian
+        POSTGRES_HOST: postgres
+        POSTGRES_PORT: "5432"
+        MINIO_ENDPOINT: http://minio:9000
+        # The in-network broker address. `.env` carries the host one, for the
+        # same reason it carries POSTGRES_HOST=localhost.
+        KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+        MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+        MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+        LAKE_BUCKET: ${LAKE_BUCKET:-meridian-lake}
+        MERIDIAN_APP_PASSWORD: ${MERIDIAN_APP_PASSWORD}
+        MERIDIAN_ETL_PASSWORD: ${MERIDIAN_ETL_PASSWORD}
+        DBT_RUNNER_PASSWORD: ${DBT_RUNNER_PASSWORD}
+        ANALYTICS_RO_PASSWORD: ${ANALYTICS_RO_PASSWORD}
+        RAG_INDEXER_PASSWORD: ${RAG_INDEXER_PASSWORD}
+        ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+        ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5}
+        EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
+        RAG_ABSTAIN_SIMILARITY: ${RAG_ABSTAIN_SIMILARITY:-0.68}
+      volumes:
+        - ./airflow/dags:/opt/airflow/dags:ro
+        # Mounted rather than baked: seeds are 23 MB of regenerable data, and the
+        # governance file and golden question set are things you want to edit
+        # without rebuilding a 4 GB image.
+        - ./seeds:/opt/meridian/seeds:ro
+        - ./docs:/opt/meridian/docs:ro
+        - ./eval:/opt/meridian/eval:ro
+        - ./contracts:/opt/meridian/contracts:ro
+        - airflow-logs:/opt/airflow/logs
+    container_name: meridian-airflow-init
+    # `db migrate` is idempotent, so this runs on every `up` rather than being a
+    # one-time step whose absence surfaces as an unexplained schema error.
+    command: >-
+      bash -c "airflow db migrate && echo 'airflow metadata database ready'"
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: meridian-airflow-apiserver
+    command: api-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: meridian-airflow-scheduler
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: meridian-airflow-dag-processor
+    command: dag-processor
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  minio-data:
+  airflow-logs:

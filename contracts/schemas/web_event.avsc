@@ -1,0 +1,27 @@
+{
+  "type": "record",
+  "name": "WebEvent",
+  "namespace": "com.meridian.ecom",
+  "doc": "A single clickstream event. Mirrors silver.web_events, minus the lineage columns Bronze adds on arrival.",
+  "fields": [
+    {"name": "event_id",    "type": "string", "doc": "Idempotency key. The Bronze sink dedups on it."},
+    {"name": "session_id",  "type": "string", "doc": "The partition key. Keeps a visitor's events in order."},
+    {"name": "customer_id", "type": ["null", "string"], "default": null,
+     "doc": "Null for anonymous browsing, which is most of a real funnel."},
+    {"name": "event_ts",
+     "type": {"type": "long", "logicalType": "timestamp-millis"},
+     "doc": "When it happened at the source, not when it was produced. The two differ and only the first is a fact about the visitor."},
+    {"name": "event_type",
+     "type": {"type": "enum", "name": "EventType",
+              "symbols": ["page_view", "product_view", "add_to_cart", "begin_checkout", "purchase", "search"]},
+     "doc": "CONTRACTS.md §9. An enum rather than a string so an unknown value fails at serialisation, at the producer, rather than at the far end of the pipeline."},
+    {"name": "product_id",  "type": ["null", "string"], "default": null},
+    {"name": "order_id",    "type": ["null", "string"], "default": null},
+    {"name": "channel",
+     "type": {"type": "enum", "name": "Channel",
+              "symbols": ["organic", "paid_search", "email", "social", "direct", "affiliate"]},
+     "doc": "The marketing channel. NOT the ticket contact channel of the same name — see CONTRACTS.md §9."},
+    {"name": "device_type",
+     "type": {"type": "enum", "name": "DeviceType", "symbols": ["desktop", "mobile", "tablet"]}}
+  ]
+}

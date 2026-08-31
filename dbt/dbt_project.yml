@@ -1,0 +1,49 @@
+name: meridian
+version: "1.0.0"
+config-version: 2
+profile: meridian
+
+# No telemetry. The project is meant to be clonable and runnable on a machine
+# with no outbound network, and a call home on every invocation is both a
+# surprise and a thing that can hang when the network is restricted.
+flags:
+  send_anonymous_usage_stats: false
+
+model-paths: ["models"]
+snapshot-paths: ["snapshots"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+# The three schemas from CONTRACTS.md §1, and the direction of travel between
+# them. dbt owns all three outright (db/init/04_roles.sql makes dbt_runner their
+# owner), so `dbt run` needs no superuser in the loop.
+models:
+  meridian:
+    staging:
+      +schema: stg
+      # Views: staging is renaming and casting, so materialising it would double
+      # the storage to save nothing. Postgres inlines them into the models below.
+      +materialized: view
+    intermediate:
+      +schema: int
+      +materialized: view
+    marts:
+      +schema: marts
+      # Tables: the dashboard queries these directly and a view would re-run the
+      # whole join graph on every page load.
+      +materialized: table
+
+snapshots:
+  meridian:
+    +target_schema: gold_int
+
+seeds:
+  meridian:
+    +schema: stg
+
+vars:
+  # The generator's anchor. dim_date is built around it rather than around
+  # now(), so the calendar covers the data instead of drifting past it.
+  anchor_date: "2026-08-01"

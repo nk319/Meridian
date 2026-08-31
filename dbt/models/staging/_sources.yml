@@ -1,0 +1,123 @@
+version: 2
+
+sources:
+  # dbt's only source is `silver`, plus one table in `rag`. It has no grant on
+  # `oltp`, `secure` or the object store, which is deliberate: the transform
+  # layer is physically unable to reach raw source data or PII, so "gold is
+  # built from silver" is enforced by the database rather than by review.
+  - name: silver
+    database: warehouse
+    schema: silver
+    description: >
+      Cleaned, typed, deduplicated entities written by
+      `meridian.lake.load_warehouse`. One row per natural key — Bronze is
+      append-only and holds every version, Silver holds the winning one.
+
+    # Freshness is measured against the loader's own metadata column, not
+    # against a business timestamp. `order_ts` going stale means the shop is
+    # quiet; `_ingested_at` going stale means the pipeline is broken, and those
+    # are different pages to wake somebody for.
+    loaded_at_field: _ingested_at
+    freshness:
+      warn_after: {count: 12, period: hour}
+      error_after: {count: 36, period: hour}
+
+    tables:
+      - name: customers
+        description: One row per customer, current state. `is_deleted` marks a source-system hard delete.
+        columns:
+          - name: customer_id
+            tests: [unique, not_null]
+          - name: loyalty_tier
+            tests:
+              - accepted_values:
+                  arguments:
+                    values: [bronze, silver, gold, platinum]
+          - name: segment
+            tests:
+              - accepted_values:
+                  arguments:
+                    values: [new, active, at_risk, churned, vip]
+
+      - name: orders
+        description: One row per order header.
+        columns:
+          - name: order_id
+            tests: [unique, not_null]
+          - name: customer_id
+            tests:
+              - not_null
+              - relationships:
+                  arguments:
+                    to: source('silver', 'customers')
+                    field: customer_id
+          - name: status
+            tests:
+              - accepted_values:
+                  arguments:
+                    values: [pending, confirmed, shipped, delivered, cancelled, returned]
+
+      - name: order_items
+        description: One row per order line.
+        columns:
+          - name: order_item_id
+            tests: [unique, not_null]
+          - name: order_id
+            tests:
+              - not_null
+              - relationships:
+                  arguments:
+                    to: source('silver', 'orders')
+                    field: order_id
+
+      - name: products
+        description: One row per product. Small and slowly changing; no SCD2.
+        columns:
+          - name: product_id
+            tests: [unique, not_null]
+
+      - name: payments
+        description: One row per payment attempt. An order can have several.
+        columns:
+          - name: payment_id
+            tests: [unique, not_null]
+          - name: status
+            tests:
+              - accepted_values:
+                  arguments:
+                    values: [authorized, captured, failed, refunded, chargeback]
+
+      - name: web_events
+        description: One row per clickstream event. `customer_id` is null for anonymous sessions.
+        columns:
+          - name: event_id
+            tests: [unique, not_null]
+
+      - name: support_tickets
+        description: >
+          One row per ticket. `intent` and `sentiment` here are the source
+          system's own labels — ground truth, never shown to the model.
+        columns:
+          - name: ticket_id
+            tests: [unique, not_null]
+
+      - name: customer_change_log
+        description: >
+          Field-level change events from the source system. Not what the SCD2
+          snapshot is built from — the snapshot watches `customers` directly —
+          but the independent record that makes the snapshot's output checkable.
+
+  - name: rag
+    database: warehouse
+    schema: rag
+    description: The masked corpus and its derivatives. dbt reads exactly one table here.
+    tables:
+      - name: ticket_enrichment
+        description: >
+          The LLM's predicted intent and sentiment per ticket, produced by
+          `meridian.rag.enrich` from masked text. Empty when no
+          ANTHROPIC_API_KEY is configured, which is a supported state: every
+          downstream `ai_*` column is then null.
+        columns:
+          - name: ticket_id
+            tests: [unique, not_null]

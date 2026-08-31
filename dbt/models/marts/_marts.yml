@@ -1,0 +1,217 @@
+version: 2
+
+models:
+  # ------------------------------------------------------------------
+  # Dimensions
+  # ------------------------------------------------------------------
+  - name: dim_date
+    description: One row per calendar day, generated from `var('anchor_date')` rather than from the facts.
+    columns:
+      - name: date_sk
+        description: yyyymmdd. The one non-hashed surrogate key in the warehouse.
+        tests: [unique, not_null]
+      - name: date_day
+        tests: [unique, not_null]
+
+  - name: dim_customer
+    description: >
+      SCD2, one row per customer version. `valid_from`/`valid_to` are half-open
+      and closed at both ends with ±infinity, so as-of joins need no coalesce.
+    columns:
+      - name: customer_sk
+        description: md5(customer_id, version). Changes across versions; `customer_id` does not.
+        tests: [unique, not_null]
+      - name: customer_id
+        tests: [not_null]
+      - name: version
+        tests: [not_null]
+      - name: loyalty_tier
+        tests:
+          - accepted_values:
+              arguments:
+                values: [bronze, silver, gold, platinum]
+    tests:
+      # The natural key plus the version is the real primary key. Testing the
+      # hash alone would pass on a broken surrogate_key macro that collided.
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [customer_id, version]
+
+  - name: dim_product
+    description: Type 1. The catalogue export carries no change log, so there is no history to keep.
+    columns:
+      - name: product_sk
+        tests: [unique, not_null]
+      - name: product_id
+        tests: [unique, not_null]
+
+  # ------------------------------------------------------------------
+  # Facts
+  # ------------------------------------------------------------------
+  - name: fact_orders
+    description: Order-header grain. Carries `total_amount`, which the line fact deliberately does not.
+    columns:
+      - name: order_sk
+        tests: [unique, not_null]
+      - name: order_id
+        tests: [unique, not_null]
+      - name: customer_sk
+        description: The customer version current when the order was placed, not the current one.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_customer')
+                field: customer_sk
+      - name: date_sk
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: date_sk
+      - name: revenue_amount
+        description: total_amount with cancelled and returned zeroed. Additive.
+        tests: [not_null]
+
+  - name: fact_order_items
+    description: Order-line grain. The half of the split that makes dim_product joinable.
+    columns:
+      - name: order_item_sk
+        tests: [unique, not_null]
+      - name: order_item_id
+        tests: [unique, not_null]
+      - name: order_sk
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('fact_orders')
+                field: order_sk
+      - name: product_sk
+        description: >
+          Nullable. ~1.5% of lines reference a product absent from the
+          catalogue export — tracked by the DQ suite as a WARN, kept here so
+          the revenue is not silently dropped.
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_product')
+                field: product_sk
+      - name: quantity
+        tests: [not_null]
+
+  - name: fact_payments
+    description: One row per payment *attempt*. Order grain would make auth rate unmeasurable.
+    columns:
+      - name: payment_sk
+        tests: [unique, not_null]
+      - name: payment_id
+        tests: [unique, not_null]
+      - name: status
+        tests:
+          - accepted_values:
+              arguments:
+                values: [authorized, captured, failed, refunded, chargeback]
+
+  - name: fact_web_events
+    description: One row per clickstream event. `customer_sk` is legitimately null for anonymous sessions.
+    columns:
+      - name: event_sk
+        tests: [unique, not_null]
+      - name: event_id
+        tests: [unique, not_null]
+      - name: event_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: [page_view, product_view, add_to_cart, begin_checkout, purchase, search]
+
+  - name: fact_support_tickets
+    description: >
+      One row per ticket, carrying the source system's labels and the model's
+      side by side. Every `ai_*` column is null without an ANTHROPIC_API_KEY.
+    columns:
+      - name: ticket_sk
+        tests: [unique, not_null]
+      - name: ticket_id
+        tests: [unique, not_null]
+      - name: intent
+        description: Ground truth from the source system. Never shown to the model.
+        tests:
+          - accepted_values:
+              arguments:
+                values: [shipping_delay, refund_request, product_defect, billing_question,
+                         account_access, return_process, general_inquiry]
+      - name: ai_intent
+        description: Predicted from masked text. Null when the enrichment has not run.
+        tests:
+          - accepted_values:
+              arguments:
+                values: [shipping_delay, refund_request, product_defect, billing_question,
+                         account_access, return_process, general_inquiry]
+              config:
+                # Null is the documented no-API-key state, and accepted_values
+                # counts nulls as failures unless told otherwise.
+                where: "ai_intent is not null"
+
+  # ------------------------------------------------------------------
+  # Marts — the seven the dashboard reads, and nothing else
+  # ------------------------------------------------------------------
+  - name: mart_daily_sales
+    description: Revenue, orders and AOV by day and channel. Gap-free calendar spine.
+    tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [date_sk, channel]
+    columns:
+      - name: revenue
+        tests: [not_null]
+      - name: nadd_aov
+        description: Non-additive. Recompute from revenue/revenue_orders after any aggregation.
+
+  - name: mart_customer_rfm
+    description: Recency/frequency/monetary per customer, scored as population quintiles.
+    columns:
+      - name: customer_id
+        tests: [unique, not_null]
+      - name: rfm_score
+        tests: [not_null]
+
+  - name: mart_cohort_retention
+    description: Retention by first-order month. A triangle, not a rectangle — future cells do not exist.
+    tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [cohort_month, months_since]
+
+  - name: mart_product_performance
+    description: Product economics by month, built on the line fact.
+    tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [month_start_date, product_id]
+
+  - name: mart_payment_health
+    description: Authorisation rate and failure mix by day and method.
+    tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [date_sk, payment_method]
+
+  - name: mart_web_funnel
+    description: Session-grain funnel. Counts decrease monotonically by construction.
+    tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [date_sk, channel, device_type]
+
+  - name: mart_support_health
+    description: >
+      Ticket volume and the AI layer's measured accuracy. Depends structurally
+      on the enrichment columns, so the AI layer cannot become a side
+      attachment nothing consumes.
+    tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [date_sk, intent, priority, contact_channel]

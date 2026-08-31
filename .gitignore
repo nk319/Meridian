@@ -27,12 +27,21 @@ minio-data/
 postgres-data/
 logs/
 
-# dbt
+# dbt. `.dbt-venv` is a second interpreter, separate from .venv on purpose —
+# CONTRACTS.md §6: Airflow pins protobuf 4.x, dbt-core requires 6.x, and keeping
+# the split locally means `make dbt-run` exercises the production arrangement.
+.dbt-venv/
 target/
 dbt_packages/
+package-lock.yml
 logs/
+# dbt writes an anonymous-usage id here on first run. Machine-local, not project state.
+.user.yml
 
 # OS / editors
 .DS_Store
 .vscode/
 .idea/
+
+# Staged at build time by `make airflow-build`; environment-specific, never committed.
+airflow/certs/*.crt

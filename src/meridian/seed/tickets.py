@@ -225,7 +225,9 @@ def make_tickets(
         elif intent == "general_inquiry":
             sentiment = rng.choices(["neutral", "positive"], weights=[0.7, 0.3], k=1)[0]
         else:
-            sentiment = rng.choices(["negative", "neutral", "positive"], weights=[0.45, 0.42, 0.13], k=1)[0]
+            sentiment = rng.choices(
+                ["negative", "neutral", "positive"], weights=[0.45, 0.42, 0.13], k=1
+            )[0]
 
         resolved = rng.random() < 0.82
         tickets.append(

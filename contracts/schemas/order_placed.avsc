@@ -1,0 +1,22 @@
+{
+  "type": "record",
+  "name": "OrderPlaced",
+  "namespace": "com.meridian.ecom",
+  "doc": "An order header at the moment it is placed. Deliberately not the whole order: status, payments and fulfilment all change later and belong to the batch path, not to an event named 'placed'.",
+  "fields": [
+    {"name": "order_id",    "type": "string"},
+    {"name": "customer_id", "type": "string", "doc": "The partition key. Two events for one customer must not be processed out of order."},
+    {"name": "order_ts",    "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    {"name": "channel",
+     "type": {"type": "enum", "name": "OrderChannel",
+              "symbols": ["organic", "paid_search", "email", "social", "direct", "affiliate"]}},
+    {"name": "device_type",
+     "type": {"type": "enum", "name": "OrderDeviceType", "symbols": ["desktop", "mobile", "tablet"]}},
+    {"name": "gross_amount",
+     "type": {"type": "bytes", "logicalType": "decimal", "precision": 12, "scale": 2},
+     "doc": "Avro decimal, not double. A float amount is a rounding error waiting for a SUM; this is the same DECIMAL(12,2) the warehouse stores."},
+    {"name": "total_amount",
+     "type": {"type": "bytes", "logicalType": "decimal", "precision": 12, "scale": 2}},
+    {"name": "line_count",  "type": "int"}
+  ]
+}

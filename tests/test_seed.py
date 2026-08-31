@@ -66,6 +66,7 @@ def seeds(tmp_path_factory) -> Path:
 # determinism
 # --------------------------------------------------------------------------
 
+
 def test_generator_is_deterministic(tmp_path):
     """Same seed, same output — byte for byte.
 
@@ -88,6 +89,7 @@ def test_different_seed_produces_different_data(tmp_path):
 # --------------------------------------------------------------------------
 # referential integrity — clean sources only
 # --------------------------------------------------------------------------
+
 
 def test_orders_reference_real_customers(seeds):
     customers = {c["customer_id"] for c in _read_csv(seeds / "oltp" / "customers.csv")}
@@ -162,6 +164,7 @@ def test_history_spans_the_requested_window(seeds):
 # SCD2 will actually be exercised
 # --------------------------------------------------------------------------
 
+
 def test_scd2_demo_customer_has_transitions(seeds):
     """A snapshot over static data yields one version per customer forever.
 
@@ -194,6 +197,7 @@ def test_scd2_hard_delete_exists(seeds):
 # --------------------------------------------------------------------------
 # PII
 # --------------------------------------------------------------------------
+
 
 def test_pii_manifest_is_populated(seeds):
     manifest = json.loads((seeds / "known_pii_terms.json").read_text())
@@ -231,6 +235,7 @@ def test_pii_columns_are_not_in_the_customers_table(seeds):
 # --------------------------------------------------------------------------
 # defect routing
 # --------------------------------------------------------------------------
+
 
 def test_defects_exist_in_third_party_feeds(seeds):
     defects = json.loads((seeds / "defect_manifest.json").read_text())
