@@ -15,6 +15,9 @@ RUN := PYTHONPATH=src $(PY)
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
+env:  ## Write .env from .env.example with generated secrets. Refuses to clobber.
+	@python3 scripts/write_env.py
+
 venv:  ## Create .venv and install the project with its rag and dev extras
 	python3 -m venv .venv
 	.venv/bin/python -m pip install --upgrade pip

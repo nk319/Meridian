@@ -1,9 +1,17 @@
 """Configuration, resolved from the environment exactly once.
 
 Everything configurable lives here, and every value comes from the environment
-or from a `.env` file that is never committed. No module reads `os.environ`
-directly — otherwise the set of knobs is whatever grep finds today, and adding
-one is invisible in review.
+or from a `.env` file that is never committed. No module outside this one and
+`meridian.api` reads `os.environ` directly — otherwise the set of knobs is
+whatever grep finds today, and adding one is invisible in review.
+
+`meridian.api` is the deliberate exception: `API_JWT_SECRET`, `API_INGEST_KEY`
+and the demo credentials belong to the API alone, so it reads them where it
+uses them. The exception cost something before it was written down — because
+the `.env` load happens inside `settings()`, and nothing under `meridian.api`
+called it, that package silently never read `.env`. It now calls `load_dotenv()`
+in its own `__init__`. A rule stated here about code that lives elsewhere is
+only as true as the last person who read it.
 
 Deliberately stdlib-only. Phase 6 brings FastAPI and pydantic-settings for the
 API; making Phase 1's indexer depend on pydantic to read five strings would

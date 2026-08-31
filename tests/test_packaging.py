@@ -170,3 +170,100 @@ def test_rag_extra_is_optional(pyproject):
     extra = " ".join(pyproject["project"]["optional-dependencies"]["rag"]).lower()
     assert "fastembed" in extra and "anthropic" in extra
     assert "fastembed" not in base and "anthropic" not in base
+
+
+# ---------------------------------------------------------------------------
+# `make env` — the first command a clone runs, and the one with no second chance
+# ---------------------------------------------------------------------------
+
+
+def test_generated_env_has_no_placeholder_left_and_no_duplicate_keys():
+    """`scripts/write_env.py` substitutes in place. Both halves matter.
+
+    `settings.load_dotenv` is first-wins — it assigns a key only
+    `if override or key not in os.environ` — so a file that copies the template
+    and *appends* overrides resolves to the placeholder, not the override. CI
+    uses that shape safely only because it then exports a deduplicated last-wins
+    copy into `$GITHUB_ENV`, and real environment variables beat the file.
+    Nothing on a developer machine does that.
+
+    The failure has no symptom, which is why it is asserted rather than trusted:
+    `change_me_locally` is a *set* value, so `db/init/04_roles.sql` accepts it
+    and the whole stack comes up correctly on a password published in a public
+    template.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("write_env", ROOT / "scripts" / "write_env.py")
+    assert spec and spec.loader
+    write_env = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(write_env)
+
+    rendered, replaced = write_env.render((ROOT / ".env.example").read_text(encoding="utf-8"))
+
+    assert replaced >= 10, (
+        f"only {replaced} secrets were generated — the matcher is probably broken"
+    )
+
+    keys, values = [], {}
+    for line in rendered.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        keys.append(key)
+        values[key] = value.strip()
+
+    duplicates = {k for k in keys if keys.count(k) > 1}
+    assert not duplicates, (
+        f"duplicate keys resolve first-wins, so these are ambiguous: {duplicates}"
+    )
+
+    survivors = {
+        k
+        for k, v in values.items()
+        if v in write_env.PLACEHOLDERS or v.startswith(write_env.FERNET_PREFIX)
+    }
+    assert not survivors, f"placeholders survived into the generated file: {survivors}"
+
+    # The JWT secret specifically: RFC 7518 §3.2 sets a 32-byte floor for HS256
+    # and PyJWT only warns below it.
+    assert len(values["API_JWT_SECRET"]) >= 32
+
+
+def test_every_secret_in_the_template_is_one_this_generator_recognises():
+    """The guard on the guard.
+
+    The generator matches placeholders by *value*, so a secret added to
+    `.env.example` with some new placeholder string would be copied through
+    verbatim and silently become the deployed value. This is what turns that
+    into a failing test rather than a quiet hole.
+    """
+    import re
+
+    suspicious = re.compile(r"(change|generate|set-a|replace|your[-_]|xxx|todo)", re.I)
+    offenders = []
+    for line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        value = value.strip()
+        if value and suspicious.search(value):
+            offenders.append((key, value))
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("write_env", ROOT / "scripts" / "write_env.py")
+    write_env = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(write_env)
+
+    unhandled = [
+        (k, v)
+        for k, v in offenders
+        if v not in write_env.PLACEHOLDERS and not v.startswith(write_env.FERNET_PREFIX)
+    ]
+    assert not unhandled, (
+        f"these look like placeholders the generator will not replace: {unhandled}. "
+        f"Add the value to PLACEHOLDERS in scripts/write_env.py."
+    )
