@@ -16,6 +16,19 @@ dependencies = [
     # dbt-postgres cannot read Parquet from object storage (CONTRACTS.md §3).
     "duckdb>=1.0",
     "pyarrow>=15.0",
+    # The distribution half of the data quality layer. Core for the same reason
+    # duckdb is: `make pipeline` ends in `meridian.dq.run --suite all`, and the
+    # `schema` suite in that union is Pandera. They were undeclared until CI
+    # existed to notice -- installed by hand in a local venv and again by hand
+    # in the Airflow image, so every machine that mattered had them and nothing
+    # said they were required.
+    #
+    # The alternative was a `dq` extra with `--suite all` skipping the Pandera
+    # checks when it is absent. Rejected: a quality suite that quietly runs a
+    # third fewer checks because an install was thin is precisely the silent
+    # failure this project is built to argue against.
+    "pandera>=0.20",
+    "pandas>=2.2",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +38,11 @@ dependencies = [
 rag = [
     "fastembed>=0.4",
     "anthropic>=0.40",
+    # Imported directly by rag/embeddings.py. It arrives transitively through
+    # fastembed today, which is not the same thing as being available: a direct
+    # import that relies on somebody else's dependency graph breaks the day they
+    # change it, and the traceback blames the wrong package.
+    "numpy>=1.26",
 ]
 # Phase 5. Optional for the same reason as `rag`: the batch platform is complete
 # without a broker, and `pip install -e .` should not pull librdkafka for
@@ -49,6 +67,9 @@ api = [
     # The client the REST ingestor uses to walk the live feed, and what
     # fastapi.testclient needs to exist at all.
     "httpx>=0.27",
+    # Imported directly by api/models.py. Transitive through fastapi, declared
+    # here for the same reason as numpy above.
+    "pydantic>=2.0",
 ]
 # Phase 7. Playwright is here rather than in `dev` because
 # `dashboard/screenshots.py` is not only a test — it produces the images in

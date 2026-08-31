@@ -83,7 +83,7 @@ COPY dashboard /opt/meridian/dashboard
 
 RUN python3 -m venv /opt/meridian-venv \
     && /opt/meridian-venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/meridian-venv/bin/pip install --no-cache-dir "/opt/meridian[rag,stream,dashboard]" pandera pandas
+    && /opt/meridian-venv/bin/pip install --no-cache-dir "/opt/meridian[rag,stream,dashboard]"
 
 RUN python3 -m venv /opt/dbt-venv \
     && /opt/dbt-venv/bin/pip install --no-cache-dir --upgrade pip \

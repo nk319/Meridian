@@ -76,16 +76,89 @@ def test_modules_that_read_a_sql_sibling_resolve_it_at_runtime():
     assert warehouse_bootstrap.DDL_PATH.is_file()
 
 
-def test_declared_dependencies_cover_what_the_pipeline_imports(pyproject):
-    """The lake cannot work without duckdb and pyarrow.
+def third_party_imports() -> dict[str, set[str]]:
+    """Every non-stdlib, non-local top-level module `src/` imports.
 
-    They arrived as a development convenience — installed by hand while building
-    Phase 2 — and only later became declared dependencies. An undeclared import
-    works on the machine that installed it by hand and nowhere else.
+    Derived by parsing the source rather than listed by hand. The hand-written
+    version of the test below missed `pandera`, `numpy` and `pydantic` for
+    months — the first was installed by hand into a local venv and again by hand
+    into the Airflow image, and the other two arrived transitively through
+    fastembed and fastapi. Every machine that mattered had all three, so nothing
+    anywhere said they were required until CI ran on a clean runner.
+
+    That is the failure mode a hardcoded list has: it only ever checks the
+    dependencies somebody remembered, which are by definition not the ones that
+    go missing.
     """
-    declared = " ".join(pyproject["project"]["dependencies"]).lower()
-    for package in ("psycopg", "pgvector", "pyyaml", "duckdb", "pyarrow"):
-        assert package in declared, f"{package} is imported by the pipeline but not declared"
+    import ast
+    import sys
+
+    stdlib = set(sys.stdlib_module_names)
+    found: dict[str, set[str]] = {}
+
+    for path in SRC.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level:
+                names = [(node.module or "").split(".")[0]]
+            else:
+                # `node.level` truthy means a relative import — `meridian`
+                # importing itself, which is never a dependency.
+                continue
+            for name in names:
+                if name and name not in stdlib and name != "meridian":
+                    found.setdefault(name, set()).add(str(path.relative_to(SRC)))
+    return found
+
+
+def _normalise(name: str) -> str:
+    return name.lower().replace("_", "-")
+
+
+def test_declared_dependencies_cover_what_the_pipeline_imports(pyproject):
+    """Every third-party import is declared somewhere in pyproject.
+
+    Module names and distribution names differ often enough that matching them
+    naively produces false passes: `yaml` ships in `PyYAML`, `jwt` in `PyJWT`,
+    `confluent_kafka` in `confluent-kafka`. `packages_distributions()` maps the
+    installed module back to the distribution that provided it, which is the
+    only reliable direction — falling back to the module name for anything not
+    installed, so a missing package fails rather than silently passing.
+    """
+    from importlib.metadata import packages_distributions
+
+    modules_to_dists = packages_distributions()
+
+    declared = " ".join(pyproject["project"]["dependencies"])
+    for group in pyproject["project"].get("optional-dependencies", {}).values():
+        declared += " " + " ".join(group)
+    declared = _normalise(declared)
+
+    undeclared = {}
+    for module, importers in third_party_imports().items():
+        candidates = {module, *modules_to_dists.get(module, [])}
+        if not any(_normalise(candidate) in declared for candidate in candidates):
+            undeclared[module] = sorted(importers)[:3]
+
+    assert not undeclared, (
+        "imported by src/ but declared in no dependency group: "
+        + "; ".join(f"{name} (from {', '.join(files)})" for name, files in undeclared.items())
+    )
+
+
+def test_the_import_scan_finds_something(pyproject):
+    """Guard: if the scan returns nothing, the test above asserts nothing.
+
+    The same reasoning as `test_there_are_data_files_to_worry_about`. A parser
+    that silently stopped matching would turn the check above into a green tick
+    over an empty set.
+    """
+    found = third_party_imports()
+    assert len(found) > 5, f"the import scan found only {sorted(found)} — it is probably broken"
+    # Three the pipeline certainly imports, as a canary on the parser itself.
+    assert {"psycopg", "duckdb", "yaml"} <= set(found)
 
 
 def test_rag_extra_is_optional(pyproject):
