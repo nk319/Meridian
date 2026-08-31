@@ -7,12 +7,16 @@ support history.
 
 > **Complete — all eight phases.** Verified from a destroyed-and-rebuilt
 > database in five minutes: `make verify-cold` runs lint, the full batch
-> pipeline, 38 data quality checks, 21 dbt models, 87 dbt tests, 271 pytest
+> pipeline, 38 data quality checks, 21 dbt models, 87 dbt tests, 272 pytest
 > tests and the retrieval evaluation, and every one of them passes.
 >
+> Every push runs [CI](.github/workflows/ci.yml): one job with no Docker, one
+> that stands the whole platform up on a clean runner.
+>
 > [`docs/CONCEPTS.md`](docs/CONCEPTS.md) maps each concept to the file that
-> demonstrates it — including a section on the ten bugs this project shipped
-> and then found, every one of which had no symptom.
+> demonstrates it — including a section on the twelve bugs this project shipped
+> and then found, every one of which had no symptom. The last two were found by
+> CI, on its first two runs.
 > [`docs/CONTRACTS.md`](docs/CONTRACTS.md) is the frozen interface between
 > components, with 21 recorded deviations.
 > [`docs/PROGRESS.md`](docs/PROGRESS.md) is the per-phase record.
@@ -681,6 +685,7 @@ The summary:
 | Stale-data warning instead of a silent fallback | `dashboard/app.py` — `freshness_banner` |
 | Non-additive measures recomputed post-aggregation | `metrics.recompute_aov` — £141 vs. £660 |
 | Rendering smoke-tested in a real browser | `dashboard/screenshots.py` |
+| CI that runs the real suite, not a subset | `.github/workflows/ci.yml` |
 | LLM enrichment scored against ground truth | `rag/enrich.py`, `mart_support_health.sql` |
 
 ---
@@ -709,8 +714,10 @@ non-trivial:
 
 ## What it verifies about itself
 
-`make verify` runs everything below against a live stack; `make verify-cold`
-destroys the volumes first, which is the only run that exercises `db/init/*.sql`
+CI runs on every push — `checks` (lint plus the suite, no Docker, ~1 min) and
+`stack` (the whole platform on a clean runner, ~6 min). Locally, `make verify`
+runs everything below against a live stack; `make verify-cold` destroys the
+volumes first, which is the only run that exercises `db/init/*.sql`
 — Postgres executes those solely on an empty data directory, so a broken init
 script survives every other target in this repository.
 
@@ -721,7 +728,7 @@ The last cold run, in five minutes:
 | `ruff check` + `ruff format --check` | clean, 83 files |
 | Data quality | **38 checks**, 0 failed, 0 blocking |
 | dbt | **21 models**, **87 tests**, 0 errors |
-| pytest | **271 passed** |
+| pytest | **272 passed** |
 | Retrieval | recall@5 **1.00** hybrid / 1.00 lexical / 0.91 vector; abstention 1.00 |
 | Streaming | 3,000 produced, 2,884 consumed per group, 116 dead-lettered, lag drains to **0** on all 3 partitions |
 | API | **17/17** endpoint steps, over the network |

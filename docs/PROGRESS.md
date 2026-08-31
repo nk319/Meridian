@@ -14,7 +14,7 @@ history, which does not survive a container restart.
 | **Status** | ✅ **Complete. All eight phases are done.** |
 | **Tag** | `phase-3` … `phase-8` — all need a human to push them, see below |
 | **Next phase** | None. The build is finished. |
-| **Next action** | Nothing is outstanding in the code. The two things a human can do that this session cannot: **push the tags** (below), and set `ANTHROPIC_API_KEY` + run `make rag-enrich` to populate `gold.mart_support_health`'s AI columns — the join, the agreement flags and the null-safe denominators are all exercised; only the model call is missing. |
+| **Next action** | Nothing is outstanding in the code, and CI is green on both jobs. The two things a human can do that this session cannot: **push the tags** (below), and set `ANTHROPIC_API_KEY` + run `make rag-enrich` to populate `gold.mart_support_health`'s AI columns — the join, the agreement flags and the null-safe denominators are all exercised; only the model call is missing. |
 
 ### What this session can and cannot push
 
@@ -646,8 +646,62 @@ are not vacuous, and the reproduction query on every quality finding.
 | 8 | `CONCEPTS.md` and cold verification | `phase-8` |
 
 **12,589 lines** of Python across `src/` and `dashboard/`, 21 dbt models,
-6 singular dbt tests, 38 data quality checks, 271 pytest tests, 3 Airflow DAGs,
+6 singular dbt tests, 38 data quality checks, 272 pytest tests, 3 Airflow DAGs,
 5 source systems, 7 warehouse schemas and 6 database roles.
+
+---
+
+## After Phase 8 — CI, and the two bugs it found
+
+Added because nothing re-ran the tests on push, which for a repository whose
+stated selling point is "verified from a destroyed database" is the gap most
+likely to make the README quietly false in six months.
+
+| Job | What it does | Time |
+| --- | --- | --- |
+| `checks` | Lint plus the whole suite with no Docker. Relies on the tests skipping themselves rather than on a hand-maintained subset that drifts | ~1 min |
+| `stack` | Postgres and MinIO up, then seed → pipeline → rag-index → gold → streaming → full suite → retrieval eval. The only job that exercises `db/init/*.sql` | ~6 min |
+
+It paid for itself on the first two runs.
+
+**Three dependencies were declared nowhere.** `pandera` (imported by
+`dq/run.py` and `dq/schemas.py`) had been hand-installed into a local venv in
+Phase 3 and hand-installed again into the Airflow image; `numpy` and `pydantic`
+were arriving transitively through fastembed and fastapi. Every machine that
+mattered had all three.
+
+The real fix was the test, not the manifest.
+`test_declared_dependencies_cover_what_the_pipeline_imports` asserted against a
+hardcoded list of five packages — which is exactly why it missed these three. A
+hand-written list only ever checks the dependencies somebody remembered, which
+are by definition not the ones that go missing. It now parses every import out
+of `src/` and resolves each back to its distribution via
+`packages_distributions()`, because module and distribution names differ often
+enough (`yaml`/PyYAML, `jwt`/PyJWT) that naive matching passes falsely.
+Verified non-vacuous by deleting the `pandera` line and confirming it
+reproduces the exact failure CI reported.
+
+`pandera` and `pandas` went into **core** dependencies rather than a `dq`
+extra. `make pipeline` ends in `meridian.dq.run --suite all`, and the `schema`
+suite in that union is Pandera. The extra was considered and rejected: it would
+mean `--suite all` quietly running a third fewer checks on a thin install,
+which is precisely the silent failure this project exists to argue against.
+
+**Eight tests failed instead of skipping when nothing was configured.** Every
+skip guard in the suite was written for "the server is down". "Not configured"
+is a different failure by a different path: `settings.dsn()` raises
+`RuntimeError` before any connection is attempted, so `server_reachable()`
+never gets to report it. `dashboard/metrics._query` let that through, and the
+`duck` fixture had no guard at all — and fixture ordering meant `(duck, etl,
+loaded)` built `duck` first, so it raised before `etl`'s skip could fire.
+
+Invisible on any developer machine, because they all have a `.env`.
+Reproducing it required moving the file **aside** — unsetting the variables was
+not enough, since `settings()` auto-loads it from disk.
+
+Both bugs had been true for weeks. Neither was visible from a machine that had
+already been set up correctly, which is the argument for CI stated more sharply
+than anything else in this document.
 
 ---
 

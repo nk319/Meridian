@@ -15,7 +15,7 @@ grains, because header-only makes `dim_product` unjoinable and line-only forces
 `count(distinct order_id)` into every revenue query" is. The second column of
 each table is where that lives.
 
-Total: **271 tests**, **12,589 lines** of Python across `src/` and `dashboard/`,
+Total: **272 tests**, **12,589 lines** of Python across `src/` and `dashboard/`,
 plus 21 dbt models, 6 singular dbt tests and 38 data quality checks.
 
 ---
@@ -44,7 +44,7 @@ plus 21 dbt models, 6 singular dbt tests and 38 data quality checks.
 | Concept | Where, and what it buys |
 | --- | --- |
 | **A frozen interface document** | [`docs/CONTRACTS.md`](CONTRACTS.md). Written before any code, and the reason the eight phases fit together: two components that agree about a table name in a design document and disagree in code produce a dashboard where not one query executes. The document's own header records that failure happening. |
-| **Recording deviations rather than editing history** | [`docs/CONTRACTS.md`](CONTRACTS.md) — the deviations table, 20 rows. Every one is a case where the contract turned out to be wrong or under-specified. Silently editing the contract would have destroyed the evidence that the design was tested against reality. |
+| **Recording deviations rather than editing history** | [`docs/CONTRACTS.md`](CONTRACTS.md) — the deviations table, 21 rows. Every one is a case where the contract turned out to be wrong or under-specified. Silently editing the contract would have destroyed the evidence that the design was tested against reality. |
 | **A single source of truth, enforced** | [`contracts/topics.yml`](../contracts/topics.yml) → [`stream/topics.py`](../src/meridian/stream/topics.py). Nothing else may name a topic; [`tests/test_stream.py`](../tests/test_stream.py) greps the package for a hardcoded one. A manifest that things bypass is documentation, not a source of truth. |
 | **A resume point that survives a lost session** | [`docs/PROGRESS.md`](PROGRESS.md). Updated as the last action of every session. The alternative is conversation history, which does not survive a container restart. |
 
@@ -220,6 +220,8 @@ plus 21 dbt models, 6 singular dbt tests and 38 data quality checks.
 | **Tests that skip with a reason** | [`tests/conftest.py`](../tests/conftest.py). DB-backed tests skip cleanly without Docker, so the suite is green in CI and meaningful locally. An empty vector store is a skip, not a pass. |
 | **Asserting the test is not vacuous** | `test_there_are_data_files_to_worry_about`, `_skip_without_gold`, the `indexed` fixture. A test that passes against an empty result set is worse than no test. |
 | **Optional extras** | [`pyproject.toml`](../pyproject.toml) — `rag`, `stream`, `api`, `dashboard`, `dev`. `pip install -e .` does not drag onnxruntime in for somebody who only wants to generate seed data. |
+| **CI that runs the real suite** | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml). Two jobs: one with no Docker that relies on the tests skipping themselves rather than on a hand-maintained subset, and one that stands the whole platform up. Both found real bugs on their first runs — see §14. |
+| **Deriving a check instead of listing it** | [`tests/test_packaging.py`](../tests/test_packaging.py) parses every import out of `src/` and resolves each to its distribution, rather than asserting against a list. The list version is what missed three dependencies. |
 
 ---
 
@@ -240,7 +242,14 @@ not, and the fix is only interesting alongside the symptom.
 | **A metrics upsert replaced instead of adding.** | Offsets guarantee a second run sees only what the first did not, so its counter starts at zero and overwriting discards everything already counted. Visible only as `events_by_type` summing to 2,892 against `events` at 2,884. |
 | **Seven of eight dashboard tabs were broken with every test green.** psycopg maps `numeric` to `decimal.Decimal`, which lands in pandas as dtype `object`. | `.sum()` works on it, so the tests passed; `.nlargest()` raises and Plotly renders an empty axis. Streamlit writes the exception into the page rather than failing, so it also served HTTP 200. |
 | **A load-bearing claim about the rankers was false.** "Vector search finds a bare rare identifier at rank 1 and only loses it when diluted" was written against one hand-picked order. | Measured over twelve: BM25 ranks the right ticket first **12/12**; vector manages **2/12** bare and **4/12** diluted. Order references share a prefix and differ only in digits, so they embed to nearly the same point. |
+| **Three dependencies were declared nowhere.** `pandera` was hand-installed into a local venv and again into the Airflow image; `numpy` and `pydantic` arrived transitively through fastembed and fastapi. | Every machine that mattered had all three, so nothing anywhere said they were required. The packaging test that exists to catch this asserted against a hardcoded list of five packages — and a hand-written list only ever checks the dependencies somebody remembered, which are by definition not the ones that go missing. Found by CI on its first run, on a clean runner. |
+| **Eight tests failed instead of skipping when nothing was configured.** Every skip guard was written for "the server is down". | "Not configured" is a different failure arriving by a different path: `settings.dsn()` raises before any connection is attempted, so `server_reachable()` never gets to report it. Invisible on any developer machine, because they all have a `.env`. Reproducing it needed the file *moved aside* — unsetting the variables was not enough, since `settings()` auto-loads it from disk. |
 | **RRF's agreement bias costs real hits.** Fusion keeps 10 of those 12. | A document one ranker puts first scores `1/61` = 0.0164; one both rank 27th and 36th scores `1/87 + 1/96` = 0.0219 and wins. `k`=60 exceeds the 50-document candidate pool, so the whole rank curve spans under a factor of two. Not retuned — §11 freezes `k` and gives the reason — but measured and asserted rather than hidden. |
+
+The last two arrived after the other ten, from CI's first two runs — which is
+the argument for CI stated more sharply than any of the rest. Both had been
+true for weeks; neither could be seen from a machine that had already been set
+up correctly.
 
 The pattern is the same in every row: **the failure had no symptom.** Nothing
 errored, nothing went red, and in most cases the output looked entirely
