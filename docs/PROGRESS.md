@@ -607,7 +607,7 @@ whole platform from a destroyed database.
 ```
 ruff check + ruff format       clean, 83 files
 data quality                   38 checks, 0 failed, 0 blocking
-dbt                            21 models, 87 tests, 0 errors
+dbt                            29 models, 87 tests, 0 errors
 pytest                         271 passed
 retrieval                      recall@5 1.00 hybrid / 1.00 lexical / 0.91 vector
                                abstention 1.00, threshold gap 0.626 → 0.730
@@ -668,7 +668,7 @@ are not vacuous, and the reproduction query on every quality finding.
 | 7 | The Streamlit dashboard, cached on the pipeline watermark | `phase-7` |
 | 8 | `CONCEPTS.md` and cold verification | `phase-8` |
 
-**12,589 lines** of Python across `src/` and `dashboard/`, 21 dbt models,
+**12,602 lines** of Python across `src/` and `dashboard/`, 29 dbt models,
 6 singular dbt tests, 38 data quality checks, 272 pytest tests, 3 Airflow DAGs,
 5 source systems, 7 warehouse schemas and 6 database roles.
 
