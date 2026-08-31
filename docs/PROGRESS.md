@@ -12,9 +12,10 @@ history, which does not survive a container restart.
 | --- | --- |
 | **Phase** | 8 — `docs/CONCEPTS.md` and the final pass |
 | **Status** | ✅ **Complete. All eight phases are done.** |
-| **Tag** | `phase-3` … `phase-8` — all need a human to push them, see below |
+| **Tag** | `phase-0` … `phase-8` — all nine are on the remote |
+| **Branch** | Merged. `main` is `242fe77`, 22 commits, every phase in its own commit |
 | **Next phase** | None. The build is finished. |
-| **Next action** | Nothing is outstanding in the code, and CI is green on both jobs. The two things a human can do that this session cannot: **push the tags** (below), and set `ANTHROPIC_API_KEY` + run `make rag-enrich` to populate `gold.mart_support_health`'s AI columns — the join, the agreement flags and the null-safe denominators are all exercised; only the model call is missing. |
+| **Next action** | Nothing is outstanding in the code, and CI is green on both jobs. One thing is still worth doing and needs a human: set `ANTHROPIC_API_KEY` and run `make rag-enrich` to populate `gold.mart_support_health`'s AI columns — the join, the agreement flags and the null-safe denominators are all exercised; only the model call is missing, and the mart correctly reports *unknown* rather than 0% accuracy in the meantime. |
 
 ### What this session can and cannot push
 
@@ -44,30 +45,52 @@ Practical consequences for a future session:
   was learned by leaving a stray `tmp-proxy-probe` branch behind that a human
   had to clean up.
 - **Tags must be pushed by a human**, from a clone whose git does not go through
-  this proxy. `phase-0`, `phase-1` and `phase-2` are all on the remote and
-  annotated; a future phase's tag will need the same treatment:
+  this proxy. All nine were. Note the asymmetry: the session cannot *write* a
+  tag but can read one back, via `list_tags` in the GitHub tool surface — so
+  "a human pushed it" is a claim a future session can and should check rather
+  than take on trust. Verified against the remote, they point here:
+
+  | tag | commit | |
+  | --- | --- | --- |
+  | `phase-0` | `d279193` | Contracts and the seed generator |
+  | `phase-1` | `53cc530` | AI/RAG core |
+  | `phase-2` | `b7b9299` | Batch ingestion and the lakehouse |
+  | `phase-3` | `bed3a3f` | Data quality and Airflow |
+  | `phase-4` | `4d849e6` | The dbt Gold star schema |
+  | `phase-5` | `1c0fce3` | Redpanda streaming and the DLQ |
+  | `phase-6` | `92c3429` | The FastAPI service |
+  | `phase-7` | `7148694` | The Streamlit dashboard |
+  | `phase-8` | `558c0d8` | `CONCEPTS.md` and cold verification |
+
+  `phase-1` is the one irregular entry: it points at `53cc530`, two commits
+  past the phase's implementation commit `c37cd65`, because it was pushed by
+  hand mid-struggle and picked up the record commit with it. Every other tag
+  sits on the phase's own commit. Left as it is — moving a tag someone has
+  already fetched to make a table tidier is a worse trade than the footnote.
+
+  To recreate them in a fresh clone, or to add one for a future phase:
 
   ```bash
-  git fetch origin
-  git push origin --tags
+  git tag -f phase-N <sha>
+  git push origin phase-N
   ```
 
-  All the tags already exist locally in this session's clone but cannot leave it.
-  To recreate them from scratch in your own clone:
+- **Do not hand a human a multi-line block to paste when git will prompt for
+  credentials.** This one cost a round trip. The tag push was sent as a single
+  pasted block; git had no credential helper configured, prompted for a
+  username, and *ate the next line of the pasted script as the answer* — then
+  the line after it as the password. Every command in the block failed, and the
+  verification at the end was `git ls-remote … | grep -c`, which reported `0`
+  from a command that had errored rather than from an empty remote. A count
+  that cannot distinguish "none found" from "the search failed" is the same
+  bug this repository spends a chapter on in the data layer, reappearing in a
+  shell one-liner. The fix is `git config --global credential.helper osxkeychain`
+  (or `manager` on Windows) and one network command run on its own first, so the
+  prompt lands on an interactive line.
 
-  ```bash
-  git tag -a phase-3 bed3a3f -m "Phase 3: data quality suites and orchestration"
-  git tag -a phase-4 4d849e6 -m "Phase 4: dbt Gold star schema"
-  git tag -a phase-5 1c0fce3 -m "Phase 5: Redpanda streaming"
-  git tag -a phase-6 92c3429 -m "Phase 6: FastAPI service"
-  git tag -a phase-7 7148694 -m "Phase 7: Streamlit dashboard"
-  git tag -a phase-8 558c0d8 -m "Phase 8: docs and final verification"
-  git push origin --tags
-  ```
-
-The branch `claude/phase-1-setup-8lokjp` carries every phase. (The name is Phase
-1's; the session was told to develop there and not to push elsewhere without
-permission.)
+Every phase lives in its own commit on `main`, which is `242fe77` — the merge of
+`claude/phase-1-setup-8lokjp`, taken as a merge commit rather than a squash
+precisely so those commits and the tags above stay meaningful.
 
 ---
 
