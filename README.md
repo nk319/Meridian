@@ -14,7 +14,7 @@ support history.
 > that stands the whole platform up on a clean runner.
 >
 > [`docs/CONCEPTS.md`](docs/CONCEPTS.md) maps each concept to the file that
-> demonstrates it — including a section on the thirteen bugs this project shipped
+> demonstrates it — including a section on the fourteen bugs this project shipped
 > and then found, every one of which had no symptom. The last two were found by
 > CI, on its first two runs.
 > [`docs/CONTRACTS.md`](docs/CONTRACTS.md) is the frozen interface between
@@ -727,7 +727,7 @@ The last cold run, in five minutes:
 | --- | --- |
 | `ruff check` + `ruff format --check` | clean, 83 files |
 | Data quality | **38 checks**, 0 failed, 0 blocking |
-| dbt | **29 models**, **87 tests**, 0 errors |
+| dbt | **29 models** — 28 built, 1 ephemeral — **87 tests**, 0 errors |
 | pytest | **272 passed** |
 | Retrieval | recall@5 **1.00** hybrid / 1.00 lexical / 0.91 vector; abstention 1.00 |
 | Streaming | 3,000 produced, 2,884 consumed per group, 116 dead-lettered, lag drains to **0** on all 3 partitions |

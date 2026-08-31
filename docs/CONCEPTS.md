@@ -25,6 +25,8 @@ when it is the other way round:
 pytest --collect-only            # 272 tests collected
 find src dashboard -name '*.py' -not -path '*/__pycache__/*' | xargs wc -l
 cd dbt && dbt ls                 # Found 29 models, 1 snapshot, 87 data tests
+                                 # `dbt run` reports PASS=28: one model is
+                                 # ephemeral, so it is inlined, never built
 ls dbt/tests/*.sql | wc -l       # 6 singular tests
 python -c "from meridian.dq import suites; print(len(suites.build()['all']))"
                                  # 31 SQL checks, plus 7 Pandera frame specs = 38
@@ -257,6 +259,7 @@ not, and the fix is only interesting alongside the symptom.
 | **Three dependencies were declared nowhere.** `pandera` was hand-installed into a local venv and again into the Airflow image; `numpy` and `pydantic` arrived transitively through fastembed and fastapi. | Every machine that mattered had all three, so nothing anywhere said they were required. The packaging test that exists to catch this asserted against a hardcoded list of five packages — and a hand-written list only ever checks the dependencies somebody remembered, which are by definition not the ones that go missing. Found by CI on its first run, on a clean runner. |
 | **Eight tests failed instead of skipping when nothing was configured.** Every skip guard was written for "the server is down". | "Not configured" is a different failure arriving by a different path: `settings.dsn()` raises before any connection is attempted, so `server_reachable()` never gets to report it. Invisible on any developer machine, because they all have a `.env`. Reproducing it needed the file *moved aside* — unsetting the variables was not enough, since `settings()` auto-loads it from disk. |
 | **RRF's agreement bias costs real hits.** Fusion keeps 10 of those 12. | A document one ranker puts first scores `1/61` = 0.0164; one both rank 27th and 36th scores `1/87 + 1/96` = 0.0219 and wins. `k`=60 exceeds the 50-document candidate pool, so the whole rank curve spans under a factor of two. Not retuned — §11 freezes `k` and gives the reason — but measured and asserted rather than hidden. |
+| **The API package never read `.env`.** `settings()` performs the `.env` load, and nothing under `meridian.api` calls `settings()` — it reads `API_JWT_SECRET` and friends from `os.environ` at the point of use, which is deliberate, but left it the one package with no config bootstrap at all. | Invisible anywhere the variables were already exported: CI writes them into `$GITHUB_ENV`, and any shell that has run `set -a; source .env` has them too. `/health` needs no token, so the server started and answered readiness checks. Only an authenticated call failed — meaning `make api-demo` died on step one from a fresh clone, while every other target in the Makefile worked. The README's "17/17 endpoint steps" had only ever been true on a machine that was already configured. |
 | **This document's own headline count was wrong.** Every summary in the repository said "21 dbt models". dbt says `Found 29 models, 1 snapshot, 87 data tests`. | The number was hand-counted once and then copied into the README, this file and `PROGRESS.md`, where it agreed with itself in three places and was never re-derived from anything. The `87` beside it was correct, which is what made the pair look verified. Found only because somebody asked what the project contained and the answer was recomputed instead of quoted — the exact failure mode this section is about, in the section about it. |
 
 Rows eleven and twelve arrived after the first ten, from CI's first two runs —
@@ -264,11 +267,21 @@ which is the argument for CI stated more sharply than any of the rest. Both had
 been true for weeks; neither could be seen from a machine that had already been
 set up correctly.
 
-The thirteenth arrived later still, and is the least comfortable of them: this
-document was itself the thing asserting an unverified number. Nothing catches
-that, because a document is not executable. The honest conclusion is that prose
-about a system is the one artefact no test covers, and it decays exactly like
-code — which is why every count above now names the command that produced it.
+The last two arrived later still, both while demonstrating the finished project
+rather than building it — which is its own lesson, since demonstrating it is the
+first time anything ran the way a stranger would run it.
+
+The thirteenth is the least comfortable of them: this document was itself the
+thing asserting an unverified number. Nothing catches that, because a document
+is not executable. The honest conclusion is that prose about a system is the one
+artefact no test covers, and it decays exactly like code — which is why every
+count above now names the command that produced it.
+
+The fourteenth is the sharper one. Every environment that had ever run the API
+already had its secrets exported, so the missing `.env` load could not be seen
+from any of them. It took a clean shell to surface, the same way the CI findings
+did — and it is the third time in this table that "works on a machine already
+set up correctly" turned out to mean "does not work."
 
 The pattern is the same in every row: **the failure had no symptom.** Nothing
 errored, nothing went red, and in most cases the output looked entirely

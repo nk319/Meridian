@@ -607,7 +607,7 @@ whole platform from a destroyed database.
 ```
 ruff check + ruff format       clean, 83 files
 data quality                   38 checks, 0 failed, 0 blocking
-dbt                            29 models, 87 tests, 0 errors
+dbt                            29 models (PASS=28, one ephemeral), 87 tests
 pytest                         271 passed
 retrieval                      recall@5 1.00 hybrid / 1.00 lexical / 0.91 vector
                                abstention 1.00, threshold gap 0.626 → 0.730

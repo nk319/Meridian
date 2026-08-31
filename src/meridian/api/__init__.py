@@ -20,3 +20,27 @@ read the JSON document this now serves; the columns, the watermark and the
 Bronze path were fixed then precisely so that swapping the transport changes
 nothing downstream.
 """
+
+from meridian.settings import load_dotenv
+
+# Bootstrap the same `.env` every other entrypoint gets.
+#
+# This package reads its own keys — API_JWT_SECRET, API_INGEST_KEY, the demo
+# credentials — straight from the environment rather than through `settings()`,
+# because they belong to the API alone and no other component has an opinion
+# about them. That part is deliberate. What was not deliberate is the
+# consequence: the `.env` load lives *inside* `settings()`, and no module under
+# `meridian.api` calls it, so this was the one package in the project that never
+# read `.env` at all.
+#
+# It was invisible wherever the variables happened to be exported already. CI
+# writes them into $GITHUB_ENV; a developer shell that has run `set -a; source
+# .env` has them too; and `/health` needs no token, so the server starts and
+# answers. On a clean shell — a fresh clone, which is the case that actually
+# matters — every authenticated endpoint failed at the first token mint, and
+# `make api-demo` died on step one while every other target in the Makefile
+# worked.
+#
+# `load_dotenv` does not override anything already set, so an explicitly
+# exported value still wins over the file.
+load_dotenv()
